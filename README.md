@@ -1,6 +1,6 @@
 # mpv-config
 
-个人 mpv 播放器配置，主要运行在Linux（wayland）平台下。
+个人 mpv 播放器配置，主要运行在 Linux(wayland) 平台下。
 
 ## 目录结构
 
