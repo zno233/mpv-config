@@ -12,15 +12,27 @@ local defaults = {
     show_no_match = false,
     max_rules = 10,
     path_depth = 0,
+    anime_keywords = "",
+    anime_languages = "",
+    anime_match = "path",
+    anime_profile = "",
 }
 
 local opts = {}
 for k, v in pairs(defaults) do opts[k] = v end
 
-local success, config = pcall(require, "mp.options")
+for i = 1, defaults.max_rules do
+    local p = "rule" .. i .. "_"
+    opts[p .. "name"] = ""
+    opts[p .. "keywords"] = ""
+    opts[p .. "languages"] = ""
+    opts[p .. "match"] = "path"
+    opts[p .. "profile"] = ""
+end
+
+local success, options = pcall(require, "mp.options")
 if success then
-    local options = config.create_options()
-    options:read_options(opts, "content-detect")
+    options.read_options(opts, "content-detect")
 end
 
 local function split(str, sep)
