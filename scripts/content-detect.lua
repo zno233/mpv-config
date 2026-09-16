@@ -20,9 +20,6 @@
 
 general 模式配置:
 - ruleN_name, ruleN_keywords, ruleN_languages, ruleN_match, ruleN_profile (N 为 1 到 max_rules 的数字)
-
-【重要提示】: 建议在 mpv.conf 的 profile 定义中加入 `profile-restore=copy`，
-以防止连续播放不同视频时 profile 设置残留。
 --]]
 
 local mp = require "mp"
@@ -355,21 +352,9 @@ local rules, global_needs = load_rules()
 -- ================= 核心检测逻辑 =================
 local detected = false
 local detect_timer = nil
-local last_profile = nil
 
 local function apply_profile(name)
-    if last_profile and last_profile ~= name then
-        mp.commandv("apply-profile", last_profile, "restore")
-    end
     mp.commandv("apply-profile", name)
-    last_profile = name
-end
-
-local function restore_profile()
-    if last_profile then
-        mp.commandv("apply-profile", last_profile, "restore")
-        last_profile = nil
-    end
 end
 
 local function do_detect()
@@ -413,12 +398,14 @@ end
 -- ================= 事件绑定 =================
 local function on_playback_restart()
     -- playback-restart 触发时，音轨和元数据通常已经就绪
-    do_detect()
+    -- 仅在尚未检测时执行，避免与 file-loaded 重复触发
+    if not detected then
+        do_detect()
+    end
 end
 
 local function on_file_loaded()
     detected = false
-    restore_profile()
     if detect_timer then
         detect_timer:kill()
         detect_timer = nil
