@@ -14,3 +14,6 @@ files/
 
 # personal resource
 fonts/超级字体包
+
+# Git mirrors used by scripts/manager.lua (not nested worktrees)
+.manager/

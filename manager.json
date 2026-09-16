@@ -1,0 +1,99 @@
+{
+  "sources": [
+    {
+      "name": "uosc",
+      "url": "https://github.com/tomasklaen/uosc.git",
+      "branch": "main",
+      "source": "src/uosc",
+      "destination": "scripts/uosc",
+      "mode": "check",
+      "baseline": "5.12.0"
+    },
+    {
+      "name": "uosc_danmaku",
+      "url": "https://github.com/Tony15246/uosc_danmaku.git",
+      "branch": "main",
+      "source": ".",
+      "destination": "scripts/uosc_danmaku",
+      "mode": "check",
+      "baseline": "948f64eef08011faf2f3eb43050062d7ce5ed1ba"
+    },
+    {
+      "name": "anime4k",
+      "url": "https://github.com/bloc97/Anime4K.git",
+      "branch": "master",
+      "source": "glsl",
+      "destination": "shaders/Anime4K/glsl",
+      "mode": "merge",
+      "blacklist": "tensorflow"
+    },
+    {
+      "name": "sub-assrt",
+      "url": "https://github.com/dyphire/mpv-sub-assrt",
+      "branch": "master",
+      "source": ".",
+      "destination": "scripts",
+      "mode": "merge",
+      "whitelist": "%.lua$"
+    },
+    {
+      "name": "sub-fastwhisper",
+      "url": "https://github.com/dyphire/mpv-sub-fastwhisper",
+      "branch": "master",
+      "source": ".",
+      "destination": "scripts",
+      "mode": "merge",
+      "whitelist": "%.lua$"
+    },
+    {
+      "name": "igv-adaptive-sharpen",
+      "url": "https://gist.github.com/8a77e4eb8276753b54bb94c1c50c317e",
+      "branch": "master",
+      "source": ".",
+      "destination": "shaders/igv",
+      "mode": "merge"
+    },
+    {
+      "name": "igv-ssimdownscaler",
+      "url": "https://gist.github.com/a015fc885d5c22e6891820ad89555637",
+      "branch": "master",
+      "source": ".",
+      "destination": "shaders/igv",
+      "mode": "merge"
+    },
+    {
+      "name": "igv-fsrcnnx",
+      "url": "https://gist.github.com/2364ffa6e81540f29cb7ab4c9bc05b6b",
+      "branch": "master",
+      "source": ".",
+      "destination": "shaders/igv",
+      "mode": "merge"
+    },
+    {
+      "name": "igv-ssimsuperres",
+      "url": "https://gist.github.com/36508af3ffc84410fe39761d6969be10",
+      "branch": "master",
+      "source": ".",
+      "destination": "shaders/igv",
+      "mode": "merge"
+    },
+    {
+      "name": "joint-bilateral",
+      "url": "https://github.com/Artoriuz/glsl-joint-bilateral",
+      "branch": "main",
+      "source": ".",
+      "destination": "shaders/other",
+      "mode": "merge",
+      "whitelist": "%.glsl$"
+    },
+    {
+      "name": "pixel-clipper",
+      "url": "https://github.com/Artoriuz/glsl-pixel-clipper",
+      "branch": "main",
+      "source": ".",
+      "destination": "shaders/other",
+      "mode": "merge",
+      "whitelist": "%.glsl$"
+    }
+  ]
+}
