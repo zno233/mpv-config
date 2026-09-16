@@ -249,17 +249,26 @@ local function eval_cond(cond)
     local env = {}
     env.get = function(prop)
         local val = mp.get_property(prop)
-        if val == nil then return nil end
+        if val == nil then return 0 end
         local num = tonumber(val)
         if num then return num end
         if val == "yes" then return true end
         if val == "no" then return false end
         return val
     end
+    setmetatable(env, { __index = function(_, key)
+        local val = mp.get_property(key)
+        if val == nil then return 0 end
+        local num = tonumber(val)
+        if num then return num end
+        if val == "yes" then return true end
+        if val == "no" then return false end
+        return val
+    end })
     env.p = setmetatable({}, {
         __index = function(_, key)
             local val = mp.get_property("p." .. key)
-            if val == nil then return nil end
+            if val == nil then return 0 end
             local num = tonumber(val)
             if num then return num end
             if val == "yes" then return true end
@@ -277,6 +286,14 @@ local function eval_cond(cond)
     env.platform = mp.get_property("platform") or ""
     env.window_maximized = mp.get_property("window-maximized") == "yes"
     env.window_minimized = mp.get_property("window-minimized") == "yes"
+    env.width = tonumber(mp.get_property("width")) or 0
+    env.height = tonumber(mp.get_property("height")) or 0
+    env.video_aspect = tonumber(mp.get_property("video-aspect")) or 0
+    env.video_par = tonumber(mp.get_property("video-params/par")) or 0
+    env.display_fps = tonumber(mp.get_property("display-fps")) or 0
+    env.container_fps = tonumber(mp.get_property("container-fps")) or 0
+    env.estimated_vf_fps = tonumber(mp.get_property("estimated-vf-fps")) or 0
+    env.current_vo = mp.get_property("current-vo") or ""
     local func, err = load("return " .. cond, "profile-cond", "t", env)
     if not func then
         msg.warn("condition compile failed: " .. cond .. " (" .. tostring(err) .. ")")
