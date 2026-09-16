@@ -338,6 +338,8 @@ end
 local function trigger_chain(head)
     local chain = chains[head]
     if not chain then return end
+    local vid = mp.get_property("vid")
+    if not vid or vid == "0" then return end
     for _, name in ipairs(chain) do
         local cond = profile_conds[name]
         if cond then
