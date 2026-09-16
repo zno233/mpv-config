@@ -286,13 +286,20 @@ local function eval_cond(cond)
     env.platform = mp.get_property("platform") or ""
     env.window_maximized = mp.get_property("window-maximized") == "yes"
     env.window_minimized = mp.get_property("window-minimized") == "yes"
-    env.width = tonumber(mp.get_property("width")) or 0
-    env.height = tonumber(mp.get_property("height")) or 0
-    env.video_aspect = tonumber(mp.get_property("video-aspect")) or 0
-    env.video_par = tonumber(mp.get_property("video-params/par")) or 0
-    env.display_fps = tonumber(mp.get_property("display-fps")) or 0
-    env.container_fps = tonumber(mp.get_property("container-fps")) or 0
-    env.estimated_vf_fps = tonumber(mp.get_property("estimated-vf-fps")) or 0
+    local w = mp.get_property("width")
+    env.width = w and tonumber(w) or 0
+    local h = mp.get_property("height")
+    env.height = h and tonumber(h) or 0
+    local va = mp.get_property("video-aspect")
+    env.video_aspect = va and tonumber(va) or 0
+    local vp = mp.get_property("video-params/par")
+    env.video_par = vp and tonumber(vp) or 0
+    local df = mp.get_property("display-fps")
+    env.display_fps = df and tonumber(df) or 0
+    local cf = mp.get_property("container-fps")
+    env.container_fps = cf and tonumber(cf) or 0
+    local ef = mp.get_property("estimated-vf-fps")
+    env.estimated_vf_fps = ef and tonumber(ef) or 0
     env.current_vo = mp.get_property("current-vo") or ""
     local func, err = load("return " .. cond, "profile-cond", "t", env)
     if not func then
