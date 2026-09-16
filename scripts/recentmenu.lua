@@ -10,6 +10,7 @@ local o = {
     width = 88,
     ignore_same_series = true,
     reduce_io = false,
+    check_deleted = false, -- 默认关闭：禁止在每次加载时同步检测失效文件，彻底根治卡顿/假死
 }
 options.read_options(o, _, function() end)
 
@@ -18,7 +19,7 @@ local path = mp.command_native({ "expand-path", o.path })
 local uosc_available = false
 local command_palette_available = false
 
-local is_windows = package.config:sub(1, 1) == "\\" -- detect path separator, windows uses backslashes
+local is_windows = package.config:sub(1, 1) == "\\"
 
 local menu = {
     type = 'recent_menu',
@@ -164,7 +165,6 @@ function jaro_winkler_distance(s1, s2)
 end
 
 function split_path(path)
-    -- return path, filename, extension
     return path:match("(.-)([^\\/]-)%.?([^%.\\/]*)$")
 end
 
@@ -172,13 +172,14 @@ function is_protocol(path)
     return type(path) == 'string' and (path:find('^%a[%w.+-]-://') ~= nil or path:find('^%a[%w.+-]-:%?') ~= nil)
 end
 
+local normalize_path = nil
 function normalize(path)
     if normalize_path ~= nil then
         if normalize_path then
-            path = mp.command_native({"normalize-path", path})
+            path = mp.command_native({ "normalize-path", path })
         else
             local directory = mp.get_property("working-directory", "")
-            path = utils.join_path(directory, path:gsub('^%.[\\/]',''))
+            path = utils.join_path(directory, path:gsub('^%.[\\/]', ''))
             if is_windows then path = path:gsub("\\", "/") end
         end
         return path
@@ -201,27 +202,23 @@ function is_same_series(path1, path2)
         return false
     end
 
-    local dir1, filename1, extension1 = split_path(path1)
-    local dir2, filename2, extension2 = split_path(path2)
+    local dir1, filename1, _ = split_path(path1)
+    local dir2, filename2, _ = split_path(path2)
 
-    -- don't remove files are not in same folder
     if dir1 ~= dir2 then
         return false
     end
 
-    -- don't remove same filename but different extensions
     if filename1 == filename2 then
         return false
     end
 
-    -- by episode
     local episode1 = filename1:gsub("^[%[%(]+.-[%]%)]+[%s%[]*", ""):match("(.-%D+)0*%d+")
     local episode2 = filename2:gsub("^[%[%(]+.-[%]%)]+[%s%[]*", ""):match("(.-%D+)0*%d+")
     if episode1 and episode2 and episode1 == episode2 then
         return true
     end
 
-    -- by similarity
     local threshold = 0.8
     local similarity = jaro_winkler_distance(filename1, filename2)
     if similarity > threshold then
@@ -232,13 +229,14 @@ function is_same_series(path1, path2)
 end
 
 function remove_deleted()
+    if not o.check_deleted then return end
     local new_items = {}
     for _, item in ipairs(menu.items) do
-        local path = item.value[2]
+        local item_path = item.value[2]
         local deleted = false
 
-        if not is_protocol(path) then
-            local meta, meta_error = utils.file_info(path)
+        if not is_protocol(item_path) then
+            local meta = utils.file_info(item_path)
             if not (meta and meta.is_file) then
                 deleted = true
             end
@@ -259,7 +257,7 @@ function read_json(force)
     if o.reduce_io and not force then
         return
     end
-    local meta, meta_error = utils.file_info(path)
+    local meta = utils.file_info(path)
     if not meta or not meta.is_file then
         menu.items = {}
         return
@@ -295,24 +293,34 @@ function write_json(force)
     end
 end
 
-function clip_uosc_menu_item(menu)
+-- 修复：改为深拷贝构造，防止重复裁剪导致标题永久变短
+function clip_uosc_menu_item(m)
     local menu_items = {}
-    for _, item in ipairs(menu.items) do
-        item.title = utf8_substring(item.title, 1, o.width)
-        table.insert(menu_items, item)
+    for _, item in ipairs(m.items) do
+        table.insert(menu_items, {
+            title = utf8_substring(item.title, 1, o.width),
+            hint = item.hint,
+            value = item.value
+        })
     end
-    menu.items = menu_items
-    return menu
+    return {
+        type = m.type,
+        title = m.title,
+        items = menu_items,
+        item_actions = m.item_actions,
+        item_actions_place = m.item_actions_place,
+        callback = m.callback
+    }
 end
 
-function append_item(path, title, hint)
-    local new_items = { { title = title, hint = hint, value = { "loadfile", path } } }
+function append_item(fpath, title, hint)
+    local new_items = { { title = title, hint = hint, value = { "loadfile", fpath } } }
     read_json()
-    for index, value in ipairs(menu.items) do
+    for _, value in ipairs(menu.items) do
         local opath = value.value[2]
         if #new_items < o.length and
-            path ~= opath and
-            not is_same_series(path, opath)
+            fpath ~= opath and
+            not is_same_series(fpath, opath)
         then
             new_items[#new_items + 1] = value
         end
@@ -395,14 +403,19 @@ end
 function on_load()
     current_item = { nil, nil, nil }
     if not o.enabled then return end
-    local path = mp.get_property("path")
-    if not path then return end
-    if not is_protocol(path) then path = normalize(path) end
-    local dir, filename, extension = split_path(path)
-    local title = mp.get_property("media-title"):gsub('%.([^%./]+)$', '')
+    local fpath = mp.get_property("path")
+    if not fpath then return end
+    if not is_protocol(fpath) then fpath = normalize(fpath) end
+    local _, filename, extension = split_path(fpath)
+    local title = mp.get_property("media-title")
+    if title then
+        title = title:gsub('%.([^%./]+)$', '')
+    else
+        title = filename
+    end
     local hint = os.date("%m/%d %H:%M")
-    if is_protocol(path) then
-        local scheme = path:match("^(%a[%w.+-]-)://")
+    if is_protocol(fpath) then
+        local scheme = fpath:match("^(%a[%w.+-]-)://")
         if scheme == "bd" or
             scheme == "dvd" or
             scheme == "dvb" or
@@ -418,7 +431,7 @@ function on_load()
         hint = extension .. " | " .. hint
     end
     hint = hint:upper()
-    current_item = { path, title, hint }
+    current_item = { fpath, title, hint }
     append_item(unpack(current_item))
 end
 
@@ -486,7 +499,7 @@ end)
 
 if o.reduce_io then
     read_json(true)
-    mp.register_event("shutdown", function (e)
+    mp.register_event("shutdown", function()
         write_json(true)
     end)
 end

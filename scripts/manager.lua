@@ -10,8 +10,21 @@
 local mp = require('mp')
 local msg = require('mp.msg')
 local utils = require('mp.utils')
+local options = require('mp.options')
 
 local plat = mp.get_property_native('platform')
+
+-- 引入可配置项，可通过 ~~/script-opts/manager.conf 覆盖
+local opts = {
+    osd_font = 'Sans',
+    osd_font_size_title = 22,
+    osd_font_size_detail = 18,
+    osd_pos_x = 330,
+    osd_pos_y = 64,  -- 弹窗 Y 轴坐标（默认靠上）
+    osd_width = 620, -- 弹窗总宽度
+    osd_height = 96, -- 弹窗总高度
+}
+options.read_options(opts, mp.get_script_name())
 
 local function join(...)
     return table.concat({ ... }, '/')
@@ -46,6 +59,7 @@ local state_path = join(store, 'state.json')
 local running = false
 local shutting_down = false
 local active_async = nil
+local active_parallel_asyncs = {}
 local worker = nil
 local resume_worker
 
@@ -73,7 +87,6 @@ local function say(level, text)
     msg[level](text)
 end
 
--- [修复核心1] 彻底采用绝对坐标绘图，避免引擎对 pos 的误判
 local function draw_rect(ax, ay, bx, by, color, alpha)
     return string.format(
         '{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H%s&\\1a&H%s&\\p1}'
@@ -127,14 +140,17 @@ end
 local function show_progress(index, total, source, status, stage, tone)
     local ratio = total > 0 and math.max(0, math.min(1, ((index - 1) + stage) / total)) or 0
     local accent = colors[tone or 'blue'] or colors.blue
-    local box_ax, box_ay, box_bx, box_by = 330, 64, 950, 160
-    local bar_ax, bar_ay, bar_bx, bar_by = box_ax + 22, box_by - 20, box_bx - 22, box_by - 10
+
+    local box_ax, box_ay = opts.osd_pos_x, opts.osd_pos_y
+    local box_bx, box_by = box_ax + opts.osd_width, box_ay + opts.osd_height
+    local bar_ax, bar_ay = box_ax + 22, box_by - 20
+    local bar_bx, bar_by = box_bx - 22, box_by - 10
     local fill_bx = bar_ax + math.floor((bar_bx - bar_ax) * ratio)
+
     local heading = string.format('SCRIPT MANAGER  %d/%d', math.min(index, total), total)
     local detail = source and source ~= '' and (source .. '  ' .. status) or status
     detail = truncate_display(detail, 78)
 
-    -- [修复核心2] 将所有元素插入数组，并用 \n 独立分层，阻止位置互相污染
     local lines = {}
     table.insert(lines, draw_rect(box_ax, box_ay, box_bx, box_by, colors.base, '18'))
     table.insert(lines, draw_rect(bar_ax, bar_ay, bar_bx, bar_by, colors.surface, '00'))
@@ -144,16 +160,15 @@ local function show_progress(index, total, source, status, stage, tone)
     end
 
     table.insert(lines, string.format(
-        '{\\an7\\pos(%d,%d)\\fnSans\\fs22\\b1\\bord0\\shad0\\1c&H%s&}%s',
-        box_ax + 22, box_ay + 14, colors.text, ass_escape(heading)
+        '{\\an7\\pos(%d,%d)\\fn%s\\fs%d\\b1\\bord0\\shad0\\1c&H%s&}%s',
+        box_ax + 22, box_ay + 14, opts.osd_font, opts.osd_font_size_title, colors.text, ass_escape(heading)
     ))
 
     table.insert(lines, string.format(
-        '{\\an7\\pos(%d,%d)\\fnSans\\fs18\\bord0\\shad0\\1c&H%s&}%s',
-        box_ax + 22, box_ay + 42, accent, ass_escape(detail)
+        '{\\an7\\pos(%d,%d)\\fn%s\\fs%d\\bord0\\shad0\\1c&H%s&}%s',
+        box_ax + 22, box_ay + 42, opts.osd_font, opts.osd_font_size_detail, accent, ass_escape(detail)
     ))
 
-    -- 用 \n 连接，把每个 UI 块隔离在独立的图层事件上
     progress_osd.data = table.concat(lines, '\n')
     progress_osd:update()
     set_manager_properties(source, status, ratio)
@@ -213,10 +228,38 @@ local function command(args)
     return coroutine.yield()
 end
 
+-- 用于发起并行的 Git 拉取任务
+local function command_parallel(jobs)
+    if shutting_down or coroutine.running() ~= worker or #jobs == 0 then return {} end
+    local results = {}
+    local pending = #jobs
+
+    for i, args in ipairs(jobs) do
+        local async_id = mp.command_native_async({
+            name = 'subprocess',
+            playback_only = false,
+            capture_stdout = true,
+            capture_stderr = true,
+            args = args,
+        }, function(success, result, error)
+            active_parallel_asyncs[i] = nil
+            results[i] = { subprocess_result(success, result, error) }
+            pending = pending - 1
+            if pending == 0 and resume_worker then
+                resume_worker(results)
+            end
+        end)
+        active_parallel_asyncs[i] = async_id
+    end
+
+    return coroutine.yield()
+end
+
+-- 完全重构 Windows 的 cmd 调用逻辑，解决路径空格断层的崩溃隐患
 local function sys_mkdir(path)
     if plat == 'windows' then
         local win_path = path:gsub('/', '\\')
-        return command({ 'cmd', '/c', 'if', 'not', 'exist', win_path, 'mkdir', win_path })
+        return command({ 'cmd', '/c', string.format('if not exist "%s" mkdir "%s"', win_path, win_path) })
     else
         return command({ 'mkdir', '-p', path })
     end
@@ -226,7 +269,7 @@ local function sys_copy_all(src, dst)
     if plat == 'windows' then
         local win_src = src:gsub('/', '\\')
         local win_dst = dst:gsub('/', '\\')
-        return command({ 'cmd', '/c', 'xcopy', win_src, win_dst, '/E', '/I', '/Y', '/Q' })
+        return command({ 'cmd', '/c', string.format('xcopy "%s" "%s" /E /I /Y /Q', win_src, win_dst) })
     else
         return command({ 'cp', '-a', src .. '/.', dst })
     end
@@ -237,9 +280,9 @@ local function sys_remove_all(path)
         local win_path = path:gsub('/', '\\')
         local info = utils.file_info(path)
         if info and info.is_dir then
-            return command({ 'cmd', '/c', 'rmdir', '/s', '/q', win_path })
+            return command({ 'cmd', '/c', string.format('rmdir /s /q "%s"', win_path) })
         else
-            return command({ 'cmd', '/c', 'del', '/f', '/q', win_path })
+            return command({ 'cmd', '/c', string.format('del /f /q "%s"', win_path) })
         end
     else
         return command({ 'rm', '-rf', path })
@@ -412,7 +455,7 @@ local function migrate_legacy_git(source)
     return true, 'backed up legacy Git metadata'
 end
 
-local function ensure_mirror(source, index, total)
+local function ensure_mirror(source, index, total, prefetch_result)
     local mirror = mirror_path(source)
     show_progress(index, total, source.name, 'checking mirror', 0.12, 'blue')
 
@@ -426,7 +469,11 @@ local function ensure_mirror(source, index, total)
 
     if not exists(mirror, 'dir') then
         show_progress(index, total, source.name, 'creating mirror', 0.22, 'blue')
-        local ok, output = command({ 'git', 'clone', '--mirror', source.url, mirror })
+        -- 追加超时防卡死
+        local ok, output = command({
+            'git', 'clone', '-c', 'http.lowSpeedLimit=1000', '-c', 'http.lowSpeedTime=10',
+            '--mirror', source.url, mirror
+        })
         if not ok then return nil, output end
     else
         local ok, output = command({ 'git', '--git-dir=' .. mirror, 'remote', 'get-url', 'origin' })
@@ -438,15 +485,23 @@ local function ensure_mirror(source, index, total)
         end
     end
 
-    show_progress(index, total, source.name, 'fetching upstream', 0.35, 'blue')
     local ref = 'refs/heads/' .. source.branch
     local refspec = '+' .. ref .. ':' .. ref
-    local ok, output = command({
-        'git', '--git-dir=' .. mirror, 'fetch', '--prune', '--tags', 'origin', refspec,
-    })
-    if not ok then return nil, output end
 
-    ok, output = command({ 'git', '--git-dir=' .. mirror, 'rev-parse', '--verify', ref })
+    -- 如果并发 Pre-fetch 已成功抓取过此源，无需再次串行发起请求
+    if prefetch_result and prefetch_result.success then
+        show_progress(index, total, source.name, 'upstream fetched (cached)', 0.35, 'blue')
+    else
+        show_progress(index, total, source.name, 'fetching upstream', 0.35, 'blue')
+        --  追加超时防卡死
+        local ok, output = command({
+            'git', '-c', 'http.lowSpeedLimit=1000', '-c', 'http.lowSpeedTime=10',
+            '--git-dir=' .. mirror, 'fetch', '--prune', '--tags', 'origin', refspec,
+        })
+        if not ok then return nil, output end
+    end
+
+    local ok, output = command({ 'git', '--git-dir=' .. mirror, 'rev-parse', '--verify', ref })
     if not ok then return nil, 'fetched branch is unavailable: ' .. output end
     return mirror, trim(output)
 end
@@ -737,7 +792,7 @@ local function merge_source(source, mirror, head, state, index, total)
         if plat == 'windows' then
             local win_src = src:gsub('/', '\\')
             local win_dst = dst:gsub('/', '\\')
-            command({ 'cmd', '/c', 'copy', '/Y', win_src, win_dst })
+            command({ 'cmd', '/c', string.format('copy /Y "%s" "%s"', win_src, win_dst) })
         else
             command({ 'cp', '-p', src, dst })
         end
@@ -759,12 +814,12 @@ local function merge_source(source, mirror, head, state, index, total)
     return true, detail, 'updated'
 end
 
-local function process_source(source, state, index, total)
+local function process_source(source, state, index, total, prefetch_result)
     if not valid_source(source) then return false, 'invalid source entry', 'error' end
     local migrated, migration_detail = migrate_legacy_git(source)
     if not migrated then return false, migration_detail, 'error' end
 
-    local mirror, head_or_error = ensure_mirror(source, index, total)
+    local mirror, head_or_error = ensure_mirror(source, index, total, prefetch_result)
     if not mirror then return false, head_or_error, 'error' end
     local head = head_or_error
     local mode = source.mode or 'check'
@@ -803,13 +858,47 @@ local function run_update()
     local stats = { updated = 0, available = 0, unchanged = 0, initialized = 0, protected = 0, error = 0 }
     say('info', 'checking ' .. #sources .. ' source(s)...')
 
+    --  执行预并发网络拉取，跳过缓慢的串行等待
+    local fetch_jobs = {}
+    local prefetch_results = {}
+
+    for i, source in ipairs(sources) do
+        if valid_source(source) then
+            local mirror = mirror_path(source)
+            if exists(mirror, 'dir') then
+                local refspec = '+refs/heads/' .. source.branch .. ':refs/heads/' .. source.branch
+                table.insert(fetch_jobs, {
+                    index = i,
+                    args = {
+                        'git', '-c', 'http.lowSpeedLimit=1000', '-c', 'http.lowSpeedTime=10',
+                        '--git-dir=' .. mirror, 'fetch', '--prune', '--tags', 'origin', refspec
+                    }
+                })
+            end
+        end
+    end
+
+    if #fetch_jobs > 0 then
+        show_progress(1, #sources, 'Batch Fetch', 'Fetching upstreams concurrently...', 0.05, 'blue')
+        local jobs = {}
+        for _, job in ipairs(fetch_jobs) do table.insert(jobs, job.args) end
+
+        local parallel_results = command_parallel(jobs)
+        for j, res in ipairs(parallel_results) do
+            local src_idx = fetch_jobs[j].index
+            prefetch_results[src_idx] = { success = res[1], detail = res[2] }
+        end
+    end
+
+    -- 串行处理主体安装逻辑
     for index, source in ipairs(sources) do
         if shutting_down then
             stats.error = stats.error + 1
             break
         end
         local name = type(source.name) == 'string' and source.name or '<unnamed>'
-        local source_ok, detail, kind = process_source(source, state, index, #sources)
+        local source_ok, detail, kind = process_source(source, state, index, #sources, prefetch_results[index])
+
         if source_ok then
             stats[kind] = (stats[kind] or 0) + 1
             local level = (kind == 'available' or kind == 'protected') and 'warn' or 'info'
@@ -838,6 +927,7 @@ resume_worker = function(...)
         say('error', 'internal updater error: ' .. tostring(error_message))
         worker = nil
         active_async = nil
+        active_parallel_asyncs = {}
         finish_progress('Internal updater error', 'red')
         return
     end
@@ -859,8 +949,13 @@ end
 mp.set_property_bool('user-data/manager/running', false)
 mp.set_property_number('user-data/manager/progress', 0)
 mp.register_script_message('manager-update-all', update_all)
+mp.add_key_binding(nil, 'update-all', update_all) -- 添加了便于在 input.conf 中设置的绑定名 script-binding manager/update-all
+
 mp.register_event('shutdown', function()
     shutting_down = true
     if active_async then mp.abort_async_command(active_async) end
+    for _, id in pairs(active_parallel_asyncs) do
+        if id then mp.abort_async_command(id) end
+    end
     progress_osd:remove()
 end)
