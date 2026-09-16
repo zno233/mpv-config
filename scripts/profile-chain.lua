@@ -344,21 +344,21 @@ local function make_debounced(fn)
     end
 end
 
--- ======================== Detect Module ========================
+-- ======================== Trigger Module ========================
 
-local Detect = {}
+local Trigger = {}
 
-function Detect.load(conf)
+function Trigger.load(conf)
     local rules, needs = {}, {}
     local function add(name, prefix)
         local chain_head = conf[prefix .. "profile"]
         if not chain_head or chain_head == "" then
-            if name ~= "" then msg.warn("detect: '" .. name .. "' no profile, skip") end
+            if name ~= "" then msg.warn("trigger: '" .. name .. "' no profile, skip") end
             return
         end
         local expr_str = conf[prefix .. "match"] or "path"
         local ast, fail = parse_expr(expr_str)
-        if fail then msg.warn("detect: '" .. name .. "' expr fail, skip"); return end
+        if fail then msg.warn("trigger: '" .. name .. "' expr fail, skip"); return end
         local r = {
             name = name or "unnamed",
             keywords = compile_keywords(split(conf[prefix .. "keywords"], ",")),
@@ -377,15 +377,10 @@ function Detect.load(conf)
         local n = conf[p .. "name"]
         if n and n ~= "" then add(n, p) end
     end
-    for _, key in ipairs({
-        "anime", "movie", "live", "drama", "doc", "news", "variety",
-    }) do
-        if conf[key .. "_keywords"] then add(key, key .. "_") end
-    end
     return rules, needs
 end
 
-function Detect.run(rules, needs, path_depth)
+function Trigger.run(rules, needs, path_depth)
     if #rules == 0 then return nil end
     local path = needs.path and (mp.get_property("path") or "") or ""
     local name = needs.name and (mp.get_property("filename") or "") or ""
@@ -416,8 +411,8 @@ local function parse_trigger(str)
             if p ~= "" then props[#props + 1] = p end
         end
         return { type = "property", props = props }
-    elseif str:match("^detect:") then
-        return { type = "detect", mode = str:sub(8) }
+    elseif str == "trigger" then
+        return { type = "trigger" }
     else
         msg.warn("unknown trigger: " .. str)
         return nil
@@ -441,7 +436,7 @@ function M.setup()
     local conf_path = mp.command_native({ "expand-path", "~~/script-opts/profile-chain.conf" })
     local sections = M.parse_conf(conf_path)
     local root = sections["_root"] or {}
-    local detect_sec = sections["detect"] or {}
+    local trigger_sec = sections["trigger"] or {}
 
     local chains, triggers_map = {}, {}
     for k, v in pairs(root) do
@@ -463,21 +458,21 @@ function M.setup()
         M.trigger_chain(head, chains, conds)
     end)
 
-    local detect_rules, detect_needs = Detect.load(detect_sec)
-    local path_depth = tonumber(detect_sec.path_depth) or 0
-    local show_osd = detect_sec.show_osd == "yes"
-    local osd_dur = (tonumber(detect_sec.osd_duration) or 1500) / 1000
-    local show_nomatch = detect_sec.show_no_match == "yes"
-    local detected = false
-    local detect_timer = nil
+    local trigger_rules, trigger_needs = Trigger.load(trigger_sec)
+    local path_depth = tonumber(trigger_sec.path_depth) or 0
+    local show_osd = trigger_sec.show_osd == "yes"
+    local osd_dur = (tonumber(trigger_sec.osd_duration) or 1500) / 1000
+    local show_nomatch = trigger_sec.show_no_match == "yes"
+    local triggered = false
+    local trigger_timer = nil
 
-    local function fire_all_detect()
-        if detected or #detect_rules == 0 then return end
-        local rule = Detect.run(detect_rules, detect_needs, path_depth)
-        detected = true
+    local function fire_all_trigger()
+        if triggered or #trigger_rules == 0 then return end
+        local rule = Trigger.run(trigger_rules, trigger_needs, path_depth)
+        triggered = true
         if rule then
             M.trigger_chain(rule.chain_head, chains, conds)
-            msg.info("detect: " .. rule.chain_head .. " (" .. rule.name .. ")")
+            msg.info("trigger: " .. rule.chain_head .. " (" .. rule.name .. ")")
             if show_osd then mp.osd_message("auto: " .. rule.name, osd_dur) end
         elseif show_nomatch then
             mp.osd_message("no match", osd_dur)
@@ -495,8 +490,8 @@ function M.setup()
     end
 
     mp.register_event("file-loaded", function()
-        detected = false
-        if detect_timer then detect_timer:kill(); detect_timer = nil end
+        triggered = false
+        if trigger_timer then trigger_timer:kill(); trigger_timer = nil end
         M.reset_cond()
         local vid = mp.get_property("vid")
         if not vid or vid == "0" then return end
@@ -507,26 +502,26 @@ function M.setup()
                 end
             end
         end
-        local has_detect = false
+        local has_trigger = false
         for _, tlist in pairs(triggers_map) do
             for _, t in ipairs(tlist) do
-                if t.type == "detect" then has_detect = true; break end
+                if t.type == "trigger" then has_trigger = true; break end
             end
-            if has_detect then break end
+            if has_trigger then break end
         end
-        if has_detect and #detect_rules > 0 then
-            if not detect_needs.audio then
-                fire_all_detect()
+        if has_trigger and #trigger_rules > 0 then
+            if not trigger_needs.audio then
+                fire_all_trigger()
             else
-                detect_timer = mp.add_timeout(0.2, function()
-                    detect_timer = nil; fire_all_detect()
+                trigger_timer = mp.add_timeout(0.2, function()
+                    trigger_timer = nil; fire_all_trigger()
                 end)
             end
         end
     end)
 
     mp.register_event("playback-restart", function()
-        if not detected then fire_all_detect() end
+        if not triggered then fire_all_trigger() end
     end)
 
     mp.register_script_message("profile-chain", function(head)
