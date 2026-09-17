@@ -2,7 +2,7 @@
 -- 模块化 Profile Chain 管理器，支持 DSL + Lua 双引擎触发
 --
 -- 功能概览：
---   1. 链定义（profile-chain.conf）：定义链头、包含的 profile 和触发方式
+--   1. 链条定义（profile-chain.conf）：定义链条名、包含的 profile 和触发方式
 --   2. 规则定义（[trigger] 段）：高级规则（keywords+languages+DSL）和简单规则（Lua 表达式）
 --   3. 执行阶段：early（start-file 时执行）/ normal（playback-restart 时执行）
 --   4. 触发方式：file / property / trigger:N / script-message 手动触发
@@ -15,7 +15,7 @@ local Utils = {}
 
 function Utils.trim(s) return (s:match("^%s*(.-)%s*$")) end
 
--- #29: 缓存每个分隔符转义后的 pattern，避免相同 sep 反复 gsub 转义
+-- 缓存每个分隔符转义后的 pattern，避免相同 sep 反复 gsub 转义
 local _split_esc_cache = {}
 function Utils.split(str, sep)
     local out = {}
@@ -109,13 +109,11 @@ function DSL.tokenize(expr)
         elseif c == "(" or c == ")" or c == "!" then
             tokens[#tokens + 1] = c; i = i + 1
         elseif c == "&" then
-            if expr:sub(i + 1, i + 1) == "&" then
-                tokens[#tokens + 1] = "&"; i = i + 2
-            else
-                tokens[#tokens + 1] = "&"; i = i + 1
-            end
-        elseif c == "|" and expr:sub(i + 1, i + 1) == "|" then
-            tokens[#tokens + 1] = "||"; i = i + 2
+            tokens[#tokens + 1] = "&"
+            i = i + (expr:sub(i + 1, i + 1) == "&" and 2 or 1)
+        elseif c == "|" then
+            tokens[#tokens + 1] = "||"
+            i = i + (expr:sub(i + 1, i + 1) == "|" and 2 or 1)
         else
             local w = expr:sub(i):match("^([%w_]+)")
             if w then
@@ -204,7 +202,7 @@ end
 local Keywords = {}
 local SEP_PAT = "[%._%-%[%] ]"
 
--- #26: 提前拼好三种匹配 pattern，match 阶段只做 find，不再现场拼字符串
+-- 提前拼好三种匹配 pattern，match 阶段只做 find，不再现场拼字符串
 function Keywords.compile(list)
     local out = {}
     for _, kw in ipairs(list) do
@@ -334,18 +332,24 @@ end
 function SandboxEnv.reset(env)
     local touched = env._touched
     if touched then
-        for i = 1, #touched do
+        for i = #touched, 1, -1 do
             rawset(env, touched[i], nil)
+            touched[i] = nil
         end
-        for i = #touched, 1, -1 do touched[i] = nil end
     end
 end
 
 -- ======================== [Module] Cond Evaluator ========================
+-- Security boundary: CondEval.eval and TriggerEngine use load("return "..expr)
+-- to execute user-defined Lua expressions from profiles.conf / profile-chain.conf.
+-- The SandboxEnv restricts the execution environment to safe standard library
+-- functions (math, string, table, pcall, etc.) and mpv property access only.
+-- Dangerous globals (os, io, loadstring, require, dofile, etc.) are NOT available.
+-- This is safe for local personal config files; do not use with untrusted input.
 local CondEval = {}
 local cond_cache = {}
 
--- #30: 缓存命中逻辑合并为一次分支判断（nil = 未缓存，false = 缓存的编译失败，
+-- 缓存命中逻辑合并为一次分支判断（nil = 未缓存，false = 缓存的编译失败，
 -- table = 缓存的可执行条目），语义与之前完全一致
 function CondEval.eval(cond_str)
     if not cond_str or cond_str == "" then return true end
@@ -380,28 +384,13 @@ local CondLoader = {}
 
 function CondLoader.load()
     local path = mp.command_native({ "expand-path", "~~/profiles.conf" })
-    local content = Utils.read_file(path)
-    if not content then
-        msg.warn("Cannot read profiles.conf at: " .. path)
-        return {}
-    end
-
+    local sections = ConfParser.parse(path)
     local conds = {}
-    local cur_name = nil
-    for line in content:gmatch("[^\n]+") do
-        line = Utils.trim(line)
-        local clean = Utils.trim(line:gsub("[ \t]+#.*$", ""))
-        local name = clean:match("^%[(.+)%]$")
-        if name then
-            cur_name = Utils.trim(name)
-        elseif cur_name then
-            local c = clean:match("^profile%-cond%s*=%s*(.+)$")
-            if c then
-                conds[cur_name] = Utils.trim(c)
-            end
+    for name, data in pairs(sections) do
+        if name ~= "_root" and data["profile-cond"] then
+            conds[name] = data["profile-cond"]
         end
     end
-
     local count = 0
     for _ in pairs(conds) do count = count + 1 end
     msg.info("Loaded " .. count .. " profile-cond(s) from " .. path)
@@ -434,29 +423,24 @@ function Chain.apply(profile_entries, conds)
         local name, forced = entry.name, entry.forced
         local cond = conds[name]
 
+        local should_apply, reason
         if forced then
-            local ok, err = pcall(mp.commandv, "apply-profile", name)
-            if ok then
-                msg.info("  ✓ " .. name .. " (forced)")
-            else
-                msg.error("  apply-profile '" .. name .. "' failed: " .. tostring(err))
-            end
+            should_apply, reason = true, "forced"
         elseif cond then
             if CondEval.eval(cond) then
-                local ok, err = pcall(mp.commandv, "apply-profile", name)
-                if ok then
-                    msg.info("  ✓ " .. name .. " (cond=true)")
-                else
-                    msg.error("  apply-profile '" .. name .. "' failed: " .. tostring(err))
-                end
+                should_apply, reason = true, "cond=true"
             else
                 msg.info("  ✗ " .. name .. " (cond=false, chain broken here)")
                 break
             end
         else
+            should_apply, reason = true, "unconditional"
+        end
+
+        if should_apply then
             local ok, err = pcall(mp.commandv, "apply-profile", name)
             if ok then
-                msg.info("  ✓ " .. name .. " (unconditional)")
+                msg.info("  ✓ " .. name .. " (" .. reason .. ")")
             else
                 msg.error("  apply-profile '" .. name .. "' failed: " .. tostring(err))
             end
@@ -533,7 +517,7 @@ function TriggerEngine.load_rules(trigger_sec)
                     local uses_title = match_str:find("title") ~= nil
                     local uses_audio = match_str:find("audio") ~= nil
 
-                    -- #28: 复用同一张 ctx 表，避免每次求值都新建/丢弃一张表；
+                    -- 复用同一张 ctx 表，避免每次求值都新建/丢弃一张表；
                     -- 每次求值前只清空本规则实际会用到的字段，语义与"每次新建空表"完全一致
                     local ctx        = {}
 
@@ -660,17 +644,27 @@ function TriggerConfig.build_map(root, chain_map)
 end
 
 -- ======================== [Main] Setup ========================
-local EXCLUDE_PATTERNS = {
-    "%.on$", "%.order$", "%.phase$", "^rule%d+_",
-    "^require_video$", "^chain_reapply_cooldown$",
-    "^show_osd$", "^osd_duration$", "^show_no_match$",
-    "^max_rules$", "^path_depth$",
+-- 链条名判断：不含 .、不在排除表、不匹配 rule\d+_ 前缀
+-- 支持无 .on 的纯 script-message 手动触发链条
+local EXCLUDE_SET = {
+    -- 全局配置项
+    require_video = true,
+    chain_reapply_cooldown = true,
+    show_osd = true,
+    osd_duration = true,
+    show_no_match = true,
+    max_rules = true,
+    path_depth = true,
+    snapshot_enabled = true,
+    snapshot_exclude = true,
+    snapshot_exclude_props = true,
+    snapshot_include_props = true,
 }
 
 local function is_chain_name(k)
-    for _, pat in ipairs(EXCLUDE_PATTERNS) do
-        if k:match(pat) then return false end
-    end
+    if k:find("%.") then return false end
+    if EXCLUDE_SET[k] then return false end
+    if k:match("^rule%d+_") then return false end
     return true
 end
 
@@ -679,9 +673,15 @@ local function chain_sort_cmp(a, b)
     return a.seq < b.seq
 end
 
--- #27: 原来对 normal_chains 遍历两遍（一遍处理 file/property 触发，
--- 一遍处理 trigger 触发），现合并为单次遍历；同一 chain_def 的 trig_list
--- 只从 triggers_map 里取一次，逻辑与合并前逐条等价（判定顺序、break 行为不变）。
+local function mark_applied(name, applied, seen)
+    if not seen[name] then
+        applied[#applied + 1] = name
+        seen[name] = true
+        return true
+    end
+    return false
+end
+
 local function evaluate_chains(normal_chains, triggers_map, trigger_rules)
     local applied = {}
     local seen = {}
@@ -691,30 +691,22 @@ local function evaluate_chains(normal_chains, triggers_map, trigger_rules)
 
     for _, chain_def in ipairs(normal_chains) do
         local trig_list = triggers_map[chain_def.name]
-        if trig_list then
+        if not trig_list then
+            mark_applied(chain_def.name, applied, seen)
+        else
             for _, t in ipairs(trig_list) do
                 if seen[chain_def.name] then
-                    -- 该 chain 已命中，其余 trigger 项无需再判定（与原实现一致：
-                    -- file/property 分支和 trigger 分支都各自检查 seen 后跳过）
+                    break
                 elseif t.type == "file" or t.type == "property" then
-                    applied[#applied + 1] = chain_def.name
-                    seen[chain_def.name] = true
+                    mark_applied(chain_def.name, applied, seen)
                 elseif t.type == "trigger" and t.rules then
-                    for _, idx in ipairs(t.rules) do
-                        evaluated_indices[idx] = true
-                    end
+                    for _, idx in ipairs(t.rules) do evaluated_indices[idx] = true end
                     local matched = TriggerEngine.run(trigger_rules, t.rules)
                     if matched then
-                        applied[#applied + 1] = chain_def.name
-                        seen[chain_def.name] = true
+                        mark_applied(chain_def.name, applied, seen)
                         msg.info("Trigger matched: " .. matched.name .. " -> " .. chain_def.name)
                     end
                 end
-            end
-        else
-            if not seen[chain_def.name] then
-                applied[#applied + 1] = chain_def.name
-                seen[chain_def.name] = true
             end
         end
     end
@@ -723,10 +715,7 @@ local function evaluate_chains(normal_chains, triggers_map, trigger_rules)
         if not evaluated_indices[rule.idx] and normal_set[rule.profile] then
             local ok, matched = pcall(rule.eval)
             if ok and matched then
-                if not seen[rule.profile] then
-                    applied[#applied + 1] = rule.profile
-                    seen[rule.profile] = true
-                end
+                mark_applied(rule.profile, applied, seen)
                 msg.info("Trigger matched: " .. rule.name .. " -> " .. rule.profile)
                 break
             end
@@ -742,7 +731,7 @@ local function build_chain_lists(root)
     local chain_seq = {}
     local seq_counter = 0
 
-    for k, v in pairs(root) do
+    for k, _ in pairs(root) do
         if is_chain_name(k) then
             chain_orders[k] = tonumber(root[k .. ".order"]) or 100
             seq_counter = seq_counter + 1
@@ -777,15 +766,79 @@ local function build_chain_lists(root)
     return chain_map, early_chains, normal_chains
 end
 
-local function read_profile_names(path)
-    local content = Utils.read_file(path)
-    if not content then return {} end
-    local names = {}
-    for line in content:gmatch("[^\n]+") do
-        local name = Utils.trim(line):match("^%[(.+)%]$")
-        if name then names[Utils.trim(name)] = true end
+-- ======================== [Module] Snapshot ========================
+local PROFILE_META_PROPS = {
+    ["profile"] = true,
+    ["profile-desc"] = true,
+    ["profile-cond"] = true,
+    ["profile-restore"] = true,
+}
+
+local function collect_snapshot_keys(profiles_path, exclude_list, exclude_props, include_props)
+    local sections = ConfParser.parse(profiles_path)
+
+    local exclude_set = {}
+    for _, name in ipairs(exclude_list) do exclude_set[name] = true end
+
+    local exclude_prop_set = {}
+    for _, prop in ipairs(exclude_props) do exclude_prop_set[prop] = true end
+
+    local keys = {}
+    local seen = {}
+    for name, data in pairs(sections) do
+        if name ~= "_root" and not exclude_set[name] then
+            for prop, _ in pairs(data) do
+                if not PROFILE_META_PROPS[prop] and not exclude_prop_set[prop] and not seen[prop] then
+                    seen[prop] = true
+                    keys[#keys + 1] = prop
+                end
+            end
+        end
     end
-    return names
+
+    for _, prop in ipairs(include_props) do
+        if not seen[prop] then
+            seen[prop] = true
+            keys[#keys + 1] = prop
+        end
+    end
+
+    return keys
+end
+
+local Snapshot = {
+    data = nil,
+    ready = false,
+    first_loaded = false,
+}
+
+function Snapshot.capture(keys)
+    local snap = {}
+    for _, prop in ipairs(keys) do
+        local v = mp.get_property_native(prop)
+        if v ~= nil then snap[prop] = v end
+    end
+    Snapshot.data = snap
+    Snapshot.ready = true
+end
+
+function Snapshot.restore()
+    if not Snapshot.data or not Snapshot.ready then return end
+    if not Snapshot.first_loaded then
+        Snapshot.first_loaded = true
+        return
+    end
+    local count = 0
+    for prop, value in pairs(Snapshot.data) do
+        local current = mp.get_property_native(prop)
+        if current ~= value then
+            mp.set_property_native(prop, value)
+            count = count + 1
+        end
+    end
+    if count > 0 then
+        msg.info("Property snapshot restored: " .. count .. " properties")
+    end
 end
 
 local function setup()
@@ -813,7 +866,7 @@ local function setup()
     local osd_pending = {}
     local osd_timer = nil
 
-    -- #32: 每条链条的"正在应用中"标记，以及应用期间被推迟的那次触发的 opts
+    -- 每条链条的"正在应用中"标记，以及应用期间被推迟的那次触发的 opts
     local chain_busy = {}
     local chain_pending = {}
     local early_applied = {}
@@ -834,7 +887,7 @@ local function setup()
     local function apply_chain(name, opts)
         opts = opts or {}
 
-        -- #32: 该链条正在应用中（Chain.apply 还没返回）——不允许重入，
+        -- 该链条正在应用中（Chain.apply 还没返回）——不允许重入，
         -- 记下这次触发的 opts，等当前这次应用结束后立即补跑一次，
         -- 而不是直接丢弃，也不是并发/嵌套执行。
         if chain_busy[name] then
@@ -945,7 +998,7 @@ local function setup()
         end
     end
 
-    -- #31: prop_chains 现在同时收纳 normal_chains 和 early_chains 里
+    -- prop_chains 现在同时收纳 normal_chains 和 early_chains 里
     -- .on=property:xxx 的链条，每条记录带 early 标记，交给下面同一个
     -- observe_property 回调按各自规则处理（early 的不再被无条件跳过）。
     local prop_chains = {}
@@ -954,30 +1007,23 @@ local function setup()
         prop_chains[prop][#prop_chains[prop] + 1] = { name = name, early = early }
     end
 
-    for _, chain_def in ipairs(normal_chains) do
-        local trig_list = triggers_map[chain_def.name]
-        if trig_list then
-            for _, t in ipairs(trig_list) do
-                if t.type == "property" then
-                    for _, prop in ipairs(t.props) do
-                        register_prop_chain(prop, chain_def.name, false)
+    local function register_chains_prop_triggers(chains, early)
+        for _, chain_def in ipairs(chains) do
+            local trig_list = triggers_map[chain_def.name]
+            if trig_list then
+                for _, t in ipairs(trig_list) do
+                    if t.type == "property" then
+                        for _, prop in ipairs(t.props) do
+                            register_prop_chain(prop, chain_def.name, early)
+                        end
                     end
                 end
             end
         end
     end
-    for _, chain_def in ipairs(early_chains) do
-        local trig_list = triggers_map[chain_def.name]
-        if trig_list then
-            for _, t in ipairs(trig_list) do
-                if t.type == "property" then
-                    for _, prop in ipairs(t.props) do
-                        register_prop_chain(prop, chain_def.name, true)
-                    end
-                end
-            end
-        end
-    end
+
+    register_chains_prop_triggers(normal_chains, false)
+    register_chains_prop_triggers(early_chains, true)
 
     for prop, entries in pairs(prop_chains) do
         mp.observe_property(prop, "native", function()
@@ -1012,23 +1058,17 @@ local function setup()
         end
 
         for _, t in ipairs(trig_list) do
-            if t.type == "file" then
-                apply_chain(chain_def.name, { skip_video_check = true })
+            local should_apply = false
+            if t.type == "file" or t.type == "property" then
+                should_apply = true
             elseif t.type == "trigger" then
-                if t.rules then
-                    local matched = TriggerEngine.run(trigger_rules, t.rules)
-                    if matched then
-                        msg.info("Trigger matched: " .. matched.name .. " -> " .. chain_def.name .. " (early)")
-                        apply_chain(chain_def.name, { skip_video_check = true })
-                    end
-                else
-                    local matched = TriggerEngine.run(trigger_rules, nil)
-                    if matched then
-                        msg.info("Trigger matched: " .. matched.name .. " -> " .. chain_def.name .. " (early)")
-                        apply_chain(chain_def.name, { skip_video_check = true })
-                    end
+                local matched = TriggerEngine.run(trigger_rules, t.rules)
+                if matched then
+                    msg.info("Trigger matched: " .. matched.name .. " -> " .. chain_def.name .. " (early)")
+                    should_apply = true
                 end
-            elseif t.type == "property" then
+            end
+            if should_apply then
                 apply_chain(chain_def.name, { skip_video_check = true })
             end
         end
@@ -1063,6 +1103,7 @@ local function setup()
             pending_initial_restart = false
             run_initial_chain_logic()
         end
+        Snapshot.restore()
     end)
 
     mp.register_event("video-reconfig", function()
@@ -1083,7 +1124,11 @@ local function setup()
     end)
 
     mp.register_script_message("profile-chain", function(name)
-        apply_chain(name, { skip_video_check = true, skip_cooldown = true })
+        if name == "restore" then
+            Snapshot.restore()
+        else
+            apply_chain(name, { skip_video_check = true, skip_cooldown = true })
+        end
     end)
 
     msg.info("profile-chain loaded: " ..
@@ -1093,20 +1138,32 @@ local function setup()
 
     -- 启动时校验：链引用的 profile 是否在 profiles.conf 中存在
     local profiles_path = mp.command_native({ "expand-path", "~~/profiles.conf" })
-    local known_profiles = read_profile_names(profiles_path)
+    local known_sections = ConfParser.parse(profiles_path)
     for name, profiles in pairs(chain_map) do
         for _, entry in ipairs(profiles) do
-            if not known_profiles[entry.name] then
+            if not known_sections[entry.name] then
                 msg.warn("Chain '" .. name .. "' references unknown profile: " .. entry.name)
             end
         end
     end
 
-    -- 校验 trigger 规则引用的 profile 是否存在
     for _, rule in ipairs(trigger_rules) do
-        if not known_profiles[rule.profile] then
+        if not known_sections[rule.profile] then
             msg.warn("Rule '" .. rule.name .. "' references unknown profile: " .. rule.profile)
         end
+    end
+
+    local snapshot_enabled = root.snapshot_enabled
+    if snapshot_enabled == "yes" then
+        local exclude_raw = root.snapshot_exclude or ""
+        local exclude_list = Utils.split(exclude_raw, ",")
+        local exclude_props_raw = root.snapshot_exclude_props or ""
+        local exclude_props = Utils.split(exclude_props_raw, ",")
+        local include_props_raw = root.snapshot_include_props or ""
+        local include_props = Utils.split(include_props_raw, ",")
+        local keys = collect_snapshot_keys(profiles_path, exclude_list, exclude_props, include_props)
+        Snapshot.capture(keys)
+        msg.info("Property snapshot captured: " .. #keys .. " properties")
     end
 end
 
