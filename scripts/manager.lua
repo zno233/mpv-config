@@ -773,8 +773,8 @@ local function merge_source(source, mirror, head, state, index, total)
             local src_info = utils.file_info(src)
             local dst_info = utils.file_info(dst)
             if src_info and dst_info and src_info.size == dst_info.size then
-                local s = io.open(src, 'rb')
-                local d = io.open(dst, 'rb')
+                local s, s_err = io.open(src, 'rb')
+                local d, d_err = io.open(dst, 'rb')
                 if s and d then
                     local sc = s:read('*a')
                     local dc = d:read('*a')
@@ -783,6 +783,11 @@ local function merge_source(source, mirror, head, state, index, total)
                     if sc == dc then
                         goto continue
                     end
+                else
+                    if not s then say('warn', source.name .. ': cannot read ' .. rel .. ': ' .. tostring(s_err)) end
+                    if not d then say('warn', source.name .. ': cannot read ' .. rel .. ': ' .. tostring(d_err)) end
+                    if s then s:close() end
+                    if d then d:close() end
                 end
             end
             local backup_name = source.name .. '/' .. rel:gsub('[/]', '%%')
@@ -835,12 +840,29 @@ local function process_source(source, state, index, total, prefetch_result)
     return ok, detail, kind
 end
 
-local function run_update()
+local function run_update(filter_name)
     local sources, load_error = load_sources()
     if not sources then
         say('error', load_error)
         finish_progress('Configuration error', 'red')
         return
+    end
+
+    local filtered_sources = sources
+    if filter_name then
+        local found = false
+        filtered_sources = {}
+        for _, s in ipairs(sources) do
+            if s.name == filter_name then
+                found = true
+                filtered_sources[#filtered_sources + 1] = s
+            end
+        end
+        if not found then
+            say('error', 'source not found: ' .. filter_name)
+            finish_progress('Source not found', 'red')
+            return
+        end
     end
 
     local ok, output = sys_mkdir(store)
@@ -856,13 +878,12 @@ local function run_update()
 
     local state = load_state()
     local stats = { updated = 0, available = 0, unchanged = 0, initialized = 0, protected = 0, error = 0 }
-    say('info', 'checking ' .. #sources .. ' source(s)...')
+    say('info', 'checking ' .. #filtered_sources .. ' source(s)...')
 
-    --  执行预并发网络拉取，跳过缓慢的串行等待
     local fetch_jobs = {}
     local prefetch_results = {}
 
-    for i, source in ipairs(sources) do
+    for i, source in ipairs(filtered_sources) do
         if valid_source(source) then
             local mirror = mirror_path(source)
             if exists(mirror, 'dir') then
@@ -879,7 +900,7 @@ local function run_update()
     end
 
     if #fetch_jobs > 0 then
-        show_progress(1, #sources, 'Batch Fetch', 'Fetching upstreams concurrently...', 0.05, 'blue')
+        show_progress(1, #filtered_sources, 'Batch Fetch', 'Fetching upstreams concurrently...', 0.05, 'blue')
         local jobs = {}
         for _, job in ipairs(fetch_jobs) do table.insert(jobs, job.args) end
 
@@ -890,14 +911,13 @@ local function run_update()
         end
     end
 
-    -- 串行处理主体安装逻辑
-    for index, source in ipairs(sources) do
+    for index, source in ipairs(filtered_sources) do
         if shutting_down then
             stats.error = stats.error + 1
             break
         end
         local name = type(source.name) == 'string' and source.name or '<unnamed>'
-        local source_ok, detail, kind = process_source(source, state, index, #sources, prefetch_results[index])
+        local source_ok, detail, kind = process_source(source, state, index, #filtered_sources, prefetch_results[index])
 
         if source_ok then
             stats[kind] = (stats[kind] or 0) + 1
@@ -906,7 +926,7 @@ local function run_update()
         else
             stats.error = stats.error + 1
             say('error', name .. ': ' .. detail)
-            show_progress(index, #sources, name, detail, 1, 'red')
+            show_progress(index, #filtered_sources, name, detail, 1, 'red')
         end
     end
 
@@ -946,10 +966,27 @@ local function update_all()
     resume_worker()
 end
 
+local function update_one(name)
+    if not name or name == '' then
+        say('warn', 'usage: script-message manager-update <source-name>')
+        return
+    end
+    if running then
+        say('warn', 'an update check is already running')
+        return
+    end
+    running = true
+    hide_timer:kill()
+    show_progress(1, 1, name, 'Starting update check', 0, 'blue')
+    worker = coroutine.create(function() run_update(name) end)
+    resume_worker()
+end
+
 mp.set_property_bool('user-data/manager/running', false)
 mp.set_property_number('user-data/manager/progress', 0)
 mp.register_script_message('manager-update-all', update_all)
-mp.add_key_binding(nil, 'update-all', update_all) -- 添加了便于在 input.conf 中设置的绑定名 script-binding manager/update-all
+mp.register_script_message('manager-update', update_one)
+mp.add_key_binding(nil, 'update-all', update_all)
 
 mp.register_event('shutdown', function()
     shutting_down = true

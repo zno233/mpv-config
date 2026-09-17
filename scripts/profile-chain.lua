@@ -777,6 +777,17 @@ local function build_chain_lists(root)
     return chain_map, early_chains, normal_chains
 end
 
+local function read_profile_names(path)
+    local content = Utils.read_file(path)
+    if not content then return {} end
+    local names = {}
+    for line in content:gmatch("[^\n]+") do
+        local name = Utils.trim(line):match("^%[(.+)%]$")
+        if name then names[Utils.trim(name)] = true end
+    end
+    return names
+end
+
 local function setup()
     local conf_path = mp.command_native({ "expand-path", "~~/script-opts/profile-chain.conf" })
     local sections = ConfParser.parse(conf_path)
@@ -1081,8 +1092,8 @@ local function setup()
         .. tostring(require_video))
 
     -- 启动时校验：链引用的 profile 是否在 profiles.conf 中存在
-    local known_profiles = {}
-    for name in pairs(conds) do known_profiles[name] = true end
+    local profiles_path = mp.command_native({ "expand-path", "~~/profiles.conf" })
+    local known_profiles = read_profile_names(profiles_path)
     for name, profiles in pairs(chain_map) do
         for _, entry in ipairs(profiles) do
             if not known_profiles[entry.name] then
