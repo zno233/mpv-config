@@ -1,41 +1,11 @@
 -- profile-chain.lua
--- 模块化、健壮、支持 DSL + Lua 双引擎的 Profile Chain 管理器 (v11)
+-- 模块化 Profile Chain 管理器，支持 DSL + Lua 双引擎触发
 --
--- ============================================================
--- 变更记录 (Changelog - v11, 本次修复)
--- ============================================================
--- #31 [修复] early 阶段链条不再无条件在每次 start-file 套用：
---            .on=property:xxx 现在会真正注册属性监听，等属性变化才触发；
---            .on=file / .on=trigger:N 仍在 start-file 求值一次；
---            没有配置任何可识别 .on 触发类型时，保留原来"无条件应用一次"的兜底行为。
--- #32 [健壮性] apply_chain 增加"忙碌中"状态：一条链条正在应用
---            （Chain.apply 尚未返回）期间，如果又有触发想再次应用同一条链，
---            不会重入/并发执行，而是记下来，等当前这次应用结束后立即补跑一次。
--- ============================================================
--- 变更记录 (Changelog - v10)
--- ============================================================
--- #26 [性能] Keywords.compile 预先拼接好三种匹配用正则片段
---            (行首锚定 / 行尾锚定 / 中间分隔)，Keywords.match 不再在
---            每次匹配时用 ".." 现场拼接字符串，减少匹配热路径的字符串分配。
--- #27 [性能] evaluate_chains 原来对 normal_chains 遍历两遍
---            (一遍处理 file/property 触发，一遍处理 trigger 触发)，
---            现合并为单次遍历，同一 chain 的 trig_list 只查表一次。
--- #28 [性能] TriggerEngine.load_rules 中关键字/DSL 类型规则的 evaluator
---            不再每次求值都 new 一张 ctx 表，改为复用同一张表并显式清空
---            用到的字段（同 SandboxEnv 的 touched-key 思路），降低 GC 压力。
--- #29 [性能] Utils.split 对分隔符的转义结果做缓存，避免相同分隔符
---            （如 "," ";"）反复执行 gsub 转义。
--- #30 [清理] CondEval.eval 的缓存命中逻辑改为单次分支判断，逻辑等价，
---            但去掉了先前 "entry==false 判一次、not entry 再判一次" 的重复检查。
--- （以下为 v9 既有优化，保留不变）
--- #20 [性能] Keywords.compile 预编译转义模式，避免每次匹配都调用 gsub。
--- #21 [性能] SandboxEnv.reset 改用 touched key 注册表重置，避免 pairs() 哈希遍历开销。
--- #22 [性能] TriggerEngine 增加 by_idx 索引映射，trigger:N 检索效率提升至 O(1)。
--- #23 [修复] 扩充 STRING_DEFAULT_KEYS（包含 title/primaries/gamma/current_vo 等），
---            避免字符串属性未就绪时返回 0 导致 Lua 规则调用 string 方法崩溃。
--- #24 [修复] ConfParser / CondLoader 增加节头行内注释剥离，兼容 [Sec] # 注释 语法。
--- #25 [修复] Keywords.match 自动剥离 URL 查询参数，统一斜杠风格，完善网络流与 Win 路径匹配。
--- ============================================================
+-- 功能概览：
+--   1. 链定义（profile-chain.conf）：定义链头、包含的 profile 和触发方式
+--   2. 规则定义（[trigger] 段）：高级规则（keywords+languages+DSL）和简单规则（Lua 表达式）
+--   3. 执行阶段：early（start-file 时执行）/ normal（playback-restart 时执行）
+--   4. 触发方式：file / property / trigger:N / script-message 手动触发
 
 local mp = require("mp")
 local msg = require("mp.msg")
@@ -63,7 +33,7 @@ function Utils.split(str, sep)
 end
 
 function Utils.read_file(path)
-    local f = io.open(path, "r")
+    local f, err = io.open(path, "r")
     if not f then return nil end
     local content = f:read("*a")
     f:close()
@@ -93,6 +63,7 @@ local ConfParser = {}
 function ConfParser.parse(path)
     local content = Utils.read_file(path)
     if not content then return {} end
+    content = content:gsub("^\239\187\191", ""):gsub("\r\n", "\n")
 
     local sections = { _root = {} }
     local cur = "_root"
@@ -459,29 +430,36 @@ function Chain.parse_profiles(raw)
 end
 
 function Chain.apply(profile_entries, conds)
-    if not Utils.has_video() then
-        msg.debug("Chain.apply skipped: no video track")
-        return
-    end
-
     for _, entry in ipairs(profile_entries) do
         local name, forced = entry.name, entry.forced
         local cond = conds[name]
 
         if forced then
-            mp.commandv("apply-profile", name)
-            msg.info("  ✓ " .. name .. " (forced)")
+            local ok, err = pcall(mp.commandv, "apply-profile", name)
+            if ok then
+                msg.info("  ✓ " .. name .. " (forced)")
+            else
+                msg.error("  apply-profile '" .. name .. "' failed: " .. tostring(err))
+            end
         elseif cond then
             if CondEval.eval(cond) then
-                mp.commandv("apply-profile", name)
-                msg.info("  ✓ " .. name .. " (cond=true)")
+                local ok, err = pcall(mp.commandv, "apply-profile", name)
+                if ok then
+                    msg.info("  ✓ " .. name .. " (cond=true)")
+                else
+                    msg.error("  apply-profile '" .. name .. "' failed: " .. tostring(err))
+                end
             else
                 msg.info("  ✗ " .. name .. " (cond=false, chain broken here)")
                 break
             end
         else
-            mp.commandv("apply-profile", name)
-            msg.info("  ✓ " .. name .. " (unconditional)")
+            local ok, err = pcall(mp.commandv, "apply-profile", name)
+            if ok then
+                msg.info("  ✓ " .. name .. " (unconditional)")
+            else
+                msg.error("  apply-profile '" .. name .. "' failed: " .. tostring(err))
+            end
         end
     end
 end
@@ -835,7 +813,10 @@ local function setup()
         if debounce_timers[key] then debounce_timers[key]:kill() end
         debounce_timers[key] = mp.add_timeout(delay or 0.1, function()
             debounce_timers[key] = nil
-            fn()
+            local ok, err = pcall(fn)
+            if not ok then
+                msg.error("debounced callback error: " .. tostring(err))
+            end
         end)
     end
 
@@ -882,13 +863,20 @@ local function setup()
                 osd_pending[#osd_pending + 1] = name
                 if not osd_timer then
                     osd_timer = mp.add_timeout(0.15, function()
-                        local max_display = 4
-                        local items = osd_pending
-                        local start = math.max(1, #items - max_display + 1)
-                        local txt = "chain: " .. table.concat(items, " → ", start)
-                        osd_pending = {}
-                        osd_timer = nil
-                        mp.osd_message(txt, osd_dur)
+                        local ok, err = pcall(function()
+                            local max_display = 4
+                            local items = osd_pending
+                            local start = math.max(1, #items - max_display + 1)
+                            local txt = "chain: " .. table.concat(items, " → ", start)
+                            osd_pending = {}
+                            osd_timer = nil
+                            mp.osd_message(txt, osd_dur)
+                        end)
+                        if not ok then
+                            msg.error("OSD timer error: " .. tostring(err))
+                            osd_pending = {}
+                            osd_timer = nil
+                        end
                     end)
                 end
             end
@@ -898,7 +886,12 @@ local function setup()
             local pending_opts = chain_pending[name]
             if pending_opts then
                 chain_pending[name] = nil
-                mp.add_timeout(0, function() apply_chain(name, pending_opts) end)
+                mp.add_timeout(0, function()
+                    local ok, err = pcall(apply_chain, name, pending_opts)
+                    if not ok then
+                        msg.error("pending retry error: " .. tostring(err))
+                    end
+                end)
             end
         else
             msg.warn("Chain not found: " .. name)
@@ -1086,6 +1079,24 @@ local function setup()
         #early_chains ..
         " early + " .. #normal_chains .. " normal chain(s), " .. #trigger_rules .. " rule(s), require_video="
         .. tostring(require_video))
+
+    -- 启动时校验：链引用的 profile 是否在 profiles.conf 中存在
+    local known_profiles = {}
+    for name in pairs(conds) do known_profiles[name] = true end
+    for name, profiles in pairs(chain_map) do
+        for _, entry in ipairs(profiles) do
+            if not known_profiles[entry.name] then
+                msg.warn("Chain '" .. name .. "' references unknown profile: " .. entry.name)
+            end
+        end
+    end
+
+    -- 校验 trigger 规则引用的 profile 是否存在
+    for _, rule in ipairs(trigger_rules) do
+        if not known_profiles[rule.profile] then
+            msg.warn("Rule '" .. rule.name .. "' references unknown profile: " .. rule.profile)
+        end
+    end
 end
 
 setup()
