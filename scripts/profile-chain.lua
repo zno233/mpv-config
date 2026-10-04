@@ -200,7 +200,18 @@ end
 
 -- ======================== [Module] Keyword Matcher ========================
 local Keywords = {}
-local SEP_PAT = "[%._%-%[%] ]"
+-- 分隔符集合仅在此声明一处（含目录分隔符 `/`），路径与关键词共用同一套归一规则
+local SEPARATORS = "[%._%-%[%]/ ]"
+-- 归一后所有分隔符都折叠为单个空格，词边界只认这一种字符
+local BOUNDARY = " "
+
+-- 归一分隔符：折叠连续分隔符并去掉首尾边界，使 `strm_video/anime` 与
+-- 关键词 `anime` 的两侧都能用同一边界判断命中（否则 `/` 不算边界会漏判）
+local function normalize(text)
+    local s = text:gsub(SEPARATORS, BOUNDARY)
+    s = s:gsub(BOUNDARY .. "+", BOUNDARY)
+    return Utils.trim(s)
+end
 
 -- 提前拼好三种匹配 pattern，match 阶段只做 find，不再现场拼字符串
 function Keywords.compile(list)
@@ -208,26 +219,27 @@ function Keywords.compile(list)
     for _, kw in ipairs(list) do
         kw = kw:lower():gsub("\\", "/")
         local is_re = kw:sub(1, 3) == "re:"
-        local raw = is_re and kw:sub(4) or kw
+        local raw = is_re and kw:sub(4) or normalize(kw)
         if is_re then
             out[#out + 1] = { raw = raw, regex = true }
-        else
+        elseif raw ~= "" then
             local esc = raw:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%1")
             out[#out + 1] = {
                 raw = raw,
                 regex = false,
                 esc = esc,
-                pat_start = "^" .. esc .. SEP_PAT,
-                pat_end = SEP_PAT .. esc .. "$",
-                pat_mid = SEP_PAT .. esc .. SEP_PAT,
+                pat_start = "^" .. esc .. BOUNDARY,
+                pat_end = BOUNDARY .. esc .. "$",
+                pat_mid = BOUNDARY .. esc .. BOUNDARY,
             }
         end
     end
     return out
 end
 
+-- 返回：是否命中 + 实际参与匹配的路径窗口（depth 截断后原文），后者用于日志诊断
 function Keywords.match(text, compiled, depth)
-    if not text or text == "" or #compiled == 0 then return false end
+    if not text or text == "" or #compiled == 0 then return false, "" end
     local lower = text:lower():gsub("\\", "/")
     lower = lower:gsub("%?.*$", "") -- 剥离网络 URL 查询参数
 
@@ -239,22 +251,22 @@ function Keywords.match(text, compiled, depth)
         local rebuilt = {}
         for i = start, dir_count do rebuilt[#rebuilt + 1] = segments[i] end
         lower = table.concat(rebuilt, "/")
-        if lower == "" then return false end
+        if lower == "" then return false, "" end
     end
 
+    local normalized = normalize(lower)
     for _, kw in ipairs(compiled) do
         if kw.regex then
-            if lower:find(kw.raw) then return true end
-        else
-            if lower == kw.raw
-                or lower:find(kw.pat_start)
-                or lower:find(kw.pat_end)
-                or lower:find(kw.pat_mid) then
-                return true
-            end
+            -- 正则关键词保留原文（含 `/`）求值，便于写路径 pattern
+            if lower:find(kw.raw) then return true, lower end
+        elseif normalized == kw.raw
+            or normalized:find(kw.pat_start)
+            or normalized:find(kw.pat_end)
+            or normalized:find(kw.pat_mid) then
+            return true, lower
         end
     end
-    return false
+    return false, lower
 end
 
 -- ======================== [Module] Sandbox Env ========================
@@ -522,17 +534,26 @@ function TriggerEngine.load_rules(trigger_sec)
                     local ctx        = {}
 
                     evaluator        = function()
+                        local detail = {}
+
                         if uses_path then
-                            ctx.path = Keywords.match(mp.get_property("path") or "", keywords, path_depth)
+                            local ok, searched = Keywords.match(mp.get_property("path") or "", keywords, path_depth)
+                            ctx.path = ok
+                            detail[#detail + 1] = string.format("path=%s[%s]", tostring(ok), searched)
                         end
                         if uses_name then
-                            ctx.name = Keywords.match(mp.get_property("filename") or "", keywords, nil)
+                            local ok, searched = Keywords.match(mp.get_property("filename") or "", keywords, nil)
+                            ctx.name = ok
+                            detail[#detail + 1] = string.format("name=%s[%s]", tostring(ok), searched)
                         end
                         if uses_title then
-                            ctx.title = Keywords.match(mp.get_property("metadata/title") or "", keywords, nil)
+                            local ok, searched = Keywords.match(mp.get_property("metadata/title") or "", keywords, nil)
+                            ctx.title = ok
+                            detail[#detail + 1] = string.format("title=%s[%s]", tostring(ok), searched)
                         end
                         if uses_audio then
                             local lang = (mp.get_property("current-tracks/audio/lang") or ""):lower()
+                            if lang == "" then lang = "und" end -- 无语言标签视作 und（未确定），是否接受交由 languages 列表决定
                             local matched_audio = false
                             for _, l in ipairs(languages_lower) do
                                 if lang == l then
@@ -541,8 +562,13 @@ function TriggerEngine.load_rules(trigger_sec)
                                 end
                             end
                             ctx.audio = matched_audio
+                            detail[#detail + 1] = string.format("audio=%s[%s]", tostring(matched_audio), lang)
                         end
-                        return dsl_fn(ctx)
+
+                        local result = dsl_fn(ctx)
+                        msg.info(string.format("rule '%s' => %s | %s",
+                            name, tostring(result), table.concat(detail, " ")))
+                        return result
                     end
                 end
 
@@ -974,7 +1000,8 @@ local function setup()
         end
 
         if require_video and not Utils.has_video() then
-            msg.debug("run_initial_chain_logic: no video track, all chain triggers skipped")
+            msg.info("run_initial_chain_logic: no video track, all chain triggers skipped (vid="
+                .. tostring(mp.get_property("vid")) .. ")")
             rule_evaluated = true
             return
         end
@@ -986,6 +1013,11 @@ local function setup()
         end
 
         rule_evaluated = true
+
+        msg.info(string.format("evaluating chain rules | path=%s | vid=%s aid=%s",
+            tostring(mp.get_property("path")),
+            tostring(mp.get_property("vid")),
+            tostring(mp.get_property("aid"))))
 
         local applied, no_match = evaluate_chains(normal_chains, triggers_map, trigger_rules)
 
