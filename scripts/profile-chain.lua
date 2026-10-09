@@ -3,7 +3,7 @@
 --
 -- 功能概览：
 --   1. 链条定义（profile-chain.conf）：定义链条名、包含的 profile 和触发方式
---   2. 规则定义（[trigger] 段）：高级规则（keywords+languages+DSL）和简单规则（Lua 表达式）
+--   2. 规则定义（ruleN_* 键，写在文件顶层）：高级规则（keywords+languages+DSL）和简单规则（Lua 表达式）
 --   3. 执行阶段：early（start-file 时执行）/ normal（playback-restart 时执行）
 --   4. 触发方式：file / property / trigger:N / script-message 手动触发
 
@@ -19,7 +19,9 @@ function Utils.trim(s) return (s:match("^%s*(.-)%s*$")) end
 local _split_esc_cache = {}
 function Utils.split(str, sep)
     local out = {}
-    if not str or str == "" then return out end
+    -- 重复键会被 ConfParser 累积成 table，用 sep 拼回去而不是丢弃/崩溃
+    if type(str) == "table" then str = table.concat(str, sep) end
+    if type(str) ~= "string" or str == "" then return out end
     local esc_sep = _split_esc_cache[sep]
     if not esc_sep then
         esc_sep = sep:gsub("[%(%)%.%%%+%-%*%?%[%]%^%$]", "%%%0")
@@ -83,6 +85,9 @@ function ConfParser.parse(path)
                     if k and v then
                         local tbl = sections[cur]
                         if tbl[k] then
+                            -- 重复键累积成 table：`*-append` 风格的键（如 glsl-shaders-append）
+                            -- 在 mpv 配置里本来就靠多行叠加，属合法写法；
+                            -- 真正按单值字符串消费的键（ruleN_* 等）由各自消费方做取值防护
                             if type(tbl[k]) ~= "table" then tbl[k] = { tbl[k] } end
                             tbl[k][#tbl[k] + 1] = v
                         else
@@ -200,15 +205,14 @@ end
 
 -- ======================== [Module] Keyword Matcher ========================
 local Keywords = {}
--- 分隔符集合仅在此声明一处（含目录分隔符 `/`），路径与关键词共用同一套归一规则
-local SEPARATORS = "[%._%-%[%]/ ]"
 -- 归一后所有分隔符都折叠为单个空格，词边界只认这一种字符
 local BOUNDARY = " "
 
--- 归一分隔符：折叠连续分隔符并去掉首尾边界，使 `strm_video/anime` 与
--- 关键词 `anime` 的两侧都能用同一边界判断命中（否则 `/` 不算边界会漏判）
+-- 归一分隔符：ASCII 非字母数字一律折为空格（约定的 `[]` 及 `& - . / _` 等都在内），
+-- 字节 >=0x80 的 CJK/日文字符保留为词字符；折叠连续分隔符并去掉首尾边界，
+-- 使 `strm_video/anime`、`SweetSub&VCB-Studio` 的关键词两侧都能用同一边界判断命中
 local function normalize(text)
-    local s = text:gsub(SEPARATORS, BOUNDARY)
+    local s = text:gsub("[^%w\128-\255]", BOUNDARY)
     s = s:gsub(BOUNDARY .. "+", BOUNDARY)
     return Utils.trim(s)
 end
@@ -220,18 +224,22 @@ function Keywords.compile(list)
         kw = kw:lower():gsub("\\", "/")
         local is_re = kw:sub(1, 3) == "re:"
         local raw = is_re and kw:sub(4) or normalize(kw)
-        if is_re then
-            out[#out + 1] = { raw = raw, regex = true }
-        elseif raw ~= "" then
-            local esc = raw:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%1")
-            out[#out + 1] = {
-                raw = raw,
-                regex = false,
-                esc = esc,
-                pat_start = "^" .. esc .. BOUNDARY,
-                pat_end = BOUNDARY .. esc .. "$",
-                pat_mid = BOUNDARY .. esc .. BOUNDARY,
-            }
+        if raw ~= "" then
+            if is_re then
+                out[#out + 1] = { raw = raw, regex = true }
+            else
+                local esc = raw:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%1")
+                out[#out + 1] = {
+                    raw = raw,
+                    regex = false,
+                    pat_start = "^" .. esc .. BOUNDARY,
+                    pat_end = BOUNDARY .. esc .. "$",
+                    pat_mid = BOUNDARY .. esc .. BOUNDARY,
+                }
+            end
+        elseif is_re then
+            -- 空的 re: 关键词会让 find("") 恒为真，等于规则对所有文件生效，必须拦下
+            msg.warn("empty 're:' keyword ignored")
         end
     end
     return out
@@ -329,8 +337,9 @@ function SandboxEnv.new(aliases)
             end
             local g = LUA_GLOBALS[k]
             if g ~= nil then return g end
-            local prop_key = aliases[k] or k
-            local default = STRING_DEFAULT_KEYS[k] and "" or nil
+            -- mpv 属性名用 `-`，规则里习惯写 `_`（如 window_maximized / display_fps），先转写再取值
+            local prop_key = aliases[k] or (k:gsub("_", "-"))
+            local default = (STRING_DEFAULT_KEYS[k] or STRING_DEFAULT_KEYS[prop_key]) and "" or nil
             local v = Utils.prop(prop_key, default)
             rawset(tbl, k, v)
             touched[#touched + 1] = k
@@ -388,7 +397,9 @@ function CondEval.eval(cond_str)
         return false
     end
 
-    return result == true
+    -- 与 mpv 原生 profile-cond 一致：任何非 nil/nil/false 的结果都算命中
+    -- （例如 path:find('foo') 返回匹配位置也算真）
+    return not not result
 end
 
 -- ======================== [Module] Profile Cond Loader ========================
@@ -400,7 +411,12 @@ function CondLoader.load()
     local conds = {}
     for name, data in pairs(sections) do
         if name ~= "_root" and data["profile-cond"] then
-            conds[name] = data["profile-cond"]
+            local cond = data["profile-cond"]
+            if type(cond) == "table" then
+                msg.warn("profiles.conf: duplicate profile-cond in [" .. name .. "], using first")
+                cond = cond[1]
+            end
+            conds[name] = cond
         end
     end
     local count = 0
@@ -486,13 +502,22 @@ function TriggerEngine.load_rules(trigger_sec)
     local max = tonumber(trigger_sec.max_rules) or 10
     local path_depth = tonumber(trigger_sec.path_depth) or 0
 
+    -- name/type/match/profile 是单值键：重复出现时取首个并告警，避免 table 进入字符串运算崩溃
+    local function first_of(v, key)
+        if type(v) == "table" then
+            msg.warn("conf: key '" .. key .. "' repeated, using first value")
+            return v[1]
+        end
+        return v
+    end
+
     for i = 1, max do
         local pfx = "rule" .. i .. "_"
-        local name = trigger_sec[pfx .. "name"]
+        local name = first_of(trigger_sec[pfx .. "name"], pfx .. "name")
         if name and name ~= "" then
-            local rule_type = trigger_sec[pfx .. "type"] or "dsl"
-            local match_str = trigger_sec[pfx .. "match"] or ""
-            local profile = trigger_sec[pfx .. "profile"]
+            local rule_type = Utils.trim(first_of(trigger_sec[pfx .. "type"], pfx .. "type") or "dsl"):lower()
+            local match_str = first_of(trigger_sec[pfx .. "match"], pfx .. "match") or ""
+            local profile = first_of(trigger_sec[pfx .. "profile"], pfx .. "profile")
 
             if not profile or profile == "" then
                 msg.warn("Rule '" .. name .. "': missing profile, skipped")
@@ -513,7 +538,7 @@ function TriggerEngine.load_rules(trigger_sec)
                                 msg.error("Lua rule '" .. name .. "' runtime error: " .. tostring(res))
                                 return false
                             end
-                            return res == true
+                            return not not res
                         end
                     end
                 else
@@ -524,10 +549,12 @@ function TriggerEngine.load_rules(trigger_sec)
                     end
                     local dsl_fn     = DSL.compile(match_str)
 
-                    local uses_path  = match_str:find("path") ~= nil
-                    local uses_name  = match_str:find("name") ~= nil
-                    local uses_title = match_str:find("title") ~= nil
-                    local uses_audio = match_str:find("audio") ~= nil
+                    -- DSL 变量探测同样不区分大小写（DSL.compile 内部会把表达式转小写）
+                    local match_l    = match_str:lower()
+                    local uses_path  = match_l:find("path", 1, true) ~= nil
+                    local uses_name  = match_l:find("name", 1, true) ~= nil
+                    local uses_title = match_l:find("title", 1, true) ~= nil
+                    local uses_audio = match_l:find("audio", 1, true) ~= nil
 
                     -- 复用同一张 ctx 表，避免每次求值都新建/丢弃一张表；
                     -- 每次求值前只清空本规则实际会用到的字段，语义与"每次新建空表"完全一致
@@ -584,6 +611,9 @@ function TriggerEngine.load_rules(trigger_sec)
     return rules
 end
 
+-- 引用了不存在的规则号时每个索引只警告一次，避免每个文件刷屏
+local warned_missing_idx = {}
+
 function TriggerEngine.run(rules, indices)
     if indices then
         for _, idx in ipairs(indices) do
@@ -593,6 +623,9 @@ function TriggerEngine.run(rules, indices)
                 if ok and matched then
                     return rule
                 end
+            elseif not warned_missing_idx[idx] then
+                warned_missing_idx[idx] = true
+                msg.warn("trigger rule #" .. idx .. " not loaded (check rule" .. idx .. "_* keys / max_rules)")
             end
         end
         return nil
@@ -617,8 +650,12 @@ local TRIGGER_TYPE_PATTERN = {
         parse = function(t)
             local indices = {}
             for idx in t:match("^trigger:(.+)$"):gmatch("[^,]+") do
-                idx = tonumber(Utils.trim(idx))
-                if idx then indices[#indices + 1] = idx end
+                local num = tonumber(Utils.trim(idx))
+                if num then
+                    indices[#indices + 1] = num
+                else
+                    msg.warn("trigger: invalid rule index '" .. Utils.trim(idx) .. "' ignored")
+                end
             end
             return { type = "trigger", rules = indices }
         end
@@ -886,7 +923,6 @@ local function setup()
     local show_nomatch = trigger_sec.show_no_match == "yes"
     local chain_cooldown = tonumber(root.chain_reapply_cooldown) or 0.3
 
-    local rule_evaluated = false
     local debounce_timers = {}
     local last_apply_time = {}
     local osd_pending = {}
@@ -973,11 +1009,15 @@ local function setup()
 
             -- 应用期间如果被推迟过一次触发，现在补跑；用 add_timeout(0) 放到
             -- 下一个 tick 执行，避免在当前调用栈里直接递归。
+            -- 刚结束的这次应用已经刷新了 last_apply_time，补跑必须跳过冷却，否则必被吞掉
             local pending_opts = chain_pending[name]
             if pending_opts then
                 chain_pending[name] = nil
+                local retry_opts = {}
+                for k2, v2 in pairs(pending_opts) do retry_opts[k2] = v2 end
+                retry_opts.skip_cooldown = true
                 mp.add_timeout(0, function()
-                    local ok, err = pcall(apply_chain, name, pending_opts)
+                    local ok, err = pcall(apply_chain, name, retry_opts)
                     if not ok then
                         msg.error("pending retry error: " .. tostring(err))
                     end
@@ -1002,7 +1042,6 @@ local function setup()
         if require_video and not Utils.has_video() then
             msg.info("run_initial_chain_logic: no video track, all chain triggers skipped (vid="
                 .. tostring(mp.get_property("vid")) .. ")")
-            rule_evaluated = true
             return
         end
 
@@ -1011,8 +1050,6 @@ local function setup()
             pending_initial_restart = true
             return
         end
-
-        rule_evaluated = true
 
         msg.info(string.format("evaluating chain rules | path=%s | vid=%s aid=%s",
             tostring(mp.get_property("path")),
@@ -1107,11 +1144,17 @@ local function setup()
     end
 
     mp.register_event("start-file", function()
-        rule_evaluated = false
         pending_initial_restart = true
         video_reconfigured = false
         file_loaded = false
         early_applied = {}
+        -- 冷却只用于去重同一文件内的重复触发，换台/切集必须清零，
+        -- 否则本地播放列表里 0.3s 内开播的下一条会被当成重复而跳过
+        last_apply_time = {}
+
+        -- 先还原到启动基线再应用 early 链条；放在 file-loaded 会把刚应用的
+        -- early 链条（以及 require_video=no 时的正常链条）改回去
+        Snapshot.restore()
 
         for _, chain_def in ipairs(early_chains) do
             apply_early_chain_on_start(chain_def)
@@ -1135,7 +1178,6 @@ local function setup()
             pending_initial_restart = false
             run_initial_chain_logic()
         end
-        Snapshot.restore()
     end)
 
     mp.register_event("video-reconfig", function()
