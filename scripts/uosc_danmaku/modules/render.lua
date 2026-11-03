@@ -101,7 +101,13 @@ function render(pos_arg)
             end
 
             -- 构建 ASS 字符串
-            local ass_text = text and (ass_prefix .. text)
+            local event_font_prefix = ""
+            if event.font_size then
+                local configured_size = tonumber(options.fontsize) or fontsize
+                local adjusted_size = math.max(1, math.floor(event.font_size + fontsize - configured_size))
+                event_font_prefix = string.format("{\\fs%d}", adjusted_size)
+            end
+            local ass_text = text and (ass_prefix .. event_font_prefix .. text)
             if ass_text then
                 if event.layer == nil or tonumber(event.layer) == 0 then
                     table.insert(ass_events_low, ass_text)
@@ -212,7 +218,7 @@ function show_message(text, time)
     message_timer.timeout = time or 3
     message_timer:kill()
     message_overlay:remove()
-    local message = string.format("{\\an%d\\pos(%d,%d)}%s", options.message_anlignment,
+    local message = string.format("{\\an%d\\pos(%d,%d)}%s", options.message_alignment,
        options.message_x, options.message_y, text)
     local width, height = 1920, 1080
     local ratio = osd_width / osd_height
@@ -251,7 +257,7 @@ mp.register_event('playback-restart', function(event)
 end)
 
 mp.add_hook("on_unload", 50, function()
-    COMMENTS, DELAY = nil, 0
+    FALLBACK_TRIGGER, COMMENTS, DELAY = false, nil, 0
     stop_time_observer()
     overlay_low:remove()
     overlay_high:remove()
@@ -276,4 +282,5 @@ mp.add_hook("on_unload", 50, function()
 
     DANMAKU = {sources = {}, count = 1}
     mp.set_property_native(DANMAKU_COUNT, 0)
+    mp.set_property_bool(HAS_DANMAKU, false)
 end)

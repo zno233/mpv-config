@@ -15,6 +15,7 @@ require("modules/utils")
 require("modules/parse")
 require("modules/guess")
 require('modules/render')
+require('modules/blacklist')
 require('modules/menu')
 require("modules/update")
 
@@ -32,7 +33,7 @@ DANMAKU_PATH = os.getenv("TEMP") or "/tmp/"
 HISTORY_PATH = mp.command_native({"expand-path", options.history_path})
 PID = utils.getpid()
 DANMAKU = {sources = {}, count = 1}
-ENABLED, COMMENTS, DELAY = false, nil, 0
+ENABLED, FALLBACK_TRIGGER, COMMENTS, DELAY = false, false, nil, 0
 DELAY_PROPERTY = string.format("user-data/%s/danmaku-delay", mp.get_script_name())
 mp.set_property_native(DELAY_PROPERTY, 0)
 HAS_DANMAKU = string.format("user-data/%s/has-danmaku", mp.get_script_name())
@@ -108,6 +109,11 @@ function set_danmaku_button()
 end
 
 function show_loaded(init)
+    if not COMMENTS then
+        show_message("comments无数据", 3)
+        msg.error("comments无数据")
+        return
+    end
     if DANMAKU.anime and DANMAKU.episode then
         show_message("匹配内容：" .. DANMAKU.anime .. "-" .. DANMAKU.episode .. "\\N弹幕加载成功，共计" .. #COMMENTS .. "条弹幕", 3)
         if init then
@@ -455,11 +461,13 @@ function read_danmaku_source_record(path)
                 delay_segments = nil
             end
 
+            local existing = DANMAKU.sources[source]
             DANMAKU.sources[source] = {
                 from = from,
                 blocked = blocked,
                 delay_segments = delay_segments,
                 from_history = true,
+                data = existing and existing.data,
             }
         end
     else
@@ -484,14 +492,17 @@ function read_danmaku_source_record(path)
                 }
             end
 
+            local existing = DANMAKU.sources[source]
             DANMAKU.sources[source] = {
                 from = from or "user_custom",
                 blocked = blocked,
                 delay_segments = delay_segments,
                 from_history = true,
+                data = existing and existing.data,
             }
 
             upgraded_sources[source] = shallow_copy(DANMAKU.sources[source])
+            upgraded_sources[source].data = nil
         end
 
         if next(upgraded_sources) then
@@ -653,6 +664,7 @@ end
 
 function init(path)
     if not path then return end
+    read_danmaku_source_record(path)
     local dir = get_parent_directory(path)
     local filename = mp.get_property('filename/no-ext')
     local video = mp.get_property_native("current-tracks/video")
@@ -680,13 +692,15 @@ mp.register_event("file-loaded", function()
     local dir = get_parent_directory(path)
     local filename = mp.get_property('filename/no-ext')
     local video = mp.get_property_native("current-tracks/video")
-    local fps = mp.get_property_number("container-fps", 0)
     local duration = mp.get_property_number("duration", 0)
-    if not video or video["image"] or video["albumart"] or fps < 23 or duration < 60 then
+
+    -- 先读取历史源，确保不满足自动加载条件时仍可手动使用。
+    read_danmaku_source_record(path)
+
+    -- 网络流在 file-loaded 时的 container-fps 可能尚未就绪。
+    if not video or video["image"] or video["albumart"] or duration < 60 then
         return
     end
-
-    read_danmaku_source_record(path)
 
     if not get_danmaku_visibility() then
         return
@@ -729,6 +743,7 @@ mp.add_key_binding(options.show_danmaku_keyboard_key, "show_danmaku_keyboard", f
     mp.commandv("script-message", "show_danmaku_keyboard")
 end)
 
+-------------- 事件注册 --------------
 mp.register_script_message("danmaku-delay", function(...)
     local commands = {...}
     local delay_str, time_str = commands[1], commands[2]
@@ -767,6 +782,14 @@ mp.register_script_message("show_danmaku_keyboard", function()
     end
 end)
 
+mp.register_script_message("auto_load_fallback", function()
+    if not FALLBACK_TRIGGER and options.auto_fallback_search and COMMENTS == nil then
+        FALLBACK_TRIGGER = true
+        msg.info("自动加载弹幕失败，自动弹出搜索框")
+        mp.commandv("script-message", "open_search_danmaku_menu")
+    end
+end)
+
 mp.register_script_message("check-update", check_for_update)
 mp.register_script_message("clear-source", clear_source)
 mp.register_script_message("immediately_save_danmaku", save_danmaku)
@@ -774,3 +797,4 @@ mp.register_script_message("open_source_delay_menu", open_delay_menu)
 mp.register_script_message("open_search_danmaku_menu", open_input_menu)
 mp.register_script_message("open_add_source_menu", open_add_menu)
 mp.register_script_message("open_add_total_menu", open_add_total_menu)
+mp.register_script_message("show_danmaku_count", show_loaded)

@@ -471,6 +471,32 @@ autoload_for_url=yes
 
 <details>
 <summary>
+auto_fallback_search
+
+> 开关全自动弹幕填装失败后弹出搜索框
+
+</summary>
+
+### auto_fallback_search
+
+#### 功能说明
+
+开启此选项后，当全自动弹幕填装选项 `auto_load=yes` 使用时，弹幕自动加载匹配全部失败后，弹出搜索框让用户手动搜索，默认关闭不使用
+
+#### 使用方法
+
+想要开启此选项，请在mpv配置文件夹下的 `script-opts`中创建 `uosc_danmaku.conf`文件并添加如下内容：
+
+```
+auto_fallback_search=yes
+```
+
+</details>
+
+---
+
+<details>
+<summary>
 autoload_local_danmaku
 
 > 开关自动加载同目录下的xml格式弹幕文件
@@ -674,6 +700,60 @@ merge_without_style=yes
 
 <details>
 <summary>
+merge_fontsize_growth
+
+> 设置合并弹幕字号随合并数量增长的速度
+
+</summary>
+
+### merge_fontsize_growth
+
+#### 功能说明
+
+配合 `merge_tolerance` 使用，默认值为 `8`，必须为正整数。设基础字号为 `fontsize`、合并数量为 `n`，实际字号为：
+
+```
+min(merge_fontsize_max, fontsize + round(merge_fontsize_growth * ln(n)))
+```
+
+取整前的对数函数严格递增且严格凹，因此合并数量较小时放大明显，随后每多合并一条弹幕带来的字号增量逐渐减小。取整后的整数字号单调不减，并受 `merge_fontsize_max` 限制。字号较大的弹幕会按实际高度占用连续的 y 轴区间；屏幕可显示区域内找不到无碰撞位置时，该条弹幕会被丢弃。
+
+#### 使用方法
+
+```
+merge_fontsize_growth=8
+```
+
+</details>
+
+---
+
+<details>
+<summary>
+merge_fontsize_max
+
+> 限制合并弹幕的最大字号
+
+</summary>
+
+### merge_fontsize_max
+
+#### 功能说明
+
+配合 `merge_fontsize_growth` 使用，默认值为 `100`。无论合并数量多大，最终字号都不会超过该值；如果该值小于基础字号 `fontsize`，则使用基础字号。
+
+#### 使用方法
+
+```
+merge_fontsize_max=100
+```
+
+</details>
+
+---
+
+<details>
+<summary>
 max_screen_danmaku
 
 > 限制屏幕中同时显示的弹幕数量
@@ -774,9 +854,11 @@ api_server
 
 允许自定义弹幕 API 的服务地址。默认使用项目维护的 `https://danmaku-api.152468.xyz`，由代理完成弹弹play API 鉴权，插件用户无需配置密钥。
 
-可指定多个用逗号分隔的有序 api_server 列表。
+可指定多个用逗号分隔的有序 api_server 列表（`有序`是指搜索结果将依据相同剧集 ID，在 api_server 中的顺序向前合并成一项）。
 
 支持每项使用 '|' 或 '#' 分隔备注，例如: "https://a.example.com|备用A" 或 "https://b.example.com#备用B"
+
+多 api_server 时搜索剧集，可以使用 ”剧集名称@server备注“ 的形式指定备注匹配 api_server 单一检索
 
 > **⚠️NOTE！**
 > 
@@ -808,18 +890,20 @@ fallback_server
 
 #### 功能说明
 
-自定义 b 站和爱腾优的弹幕获取的兜底服务器地址，主要用于获取非动画弹幕，只有在弹弹play无法解析视频源对应弹幕的情况下才会使用此处设置的服务器进行解析。可用： https://api.danmu.icu，https://dmku.hls.one
+自定义 b 站和爱腾优的弹幕获取的兜底服务器地址，主要用于获取非动画弹幕，只有在配置的所有 **`api_server`** 以及插件内置的 `站点专用解析器` 都无法解析视频源对应弹幕的情况下，才会使用此处设置的服务器进行解析。可用：https://dmku.hls.one
 
 > **⚠️NOTE！**
-> 
-> 不设置此选项的情况下默认使用 ` https://api.danmu.icu`作为兜底服务器
+>
+> 插件已在 `sites` 目录下内置了各大常规视频网站的弹幕站点专用解析器（[#377](https://github.com/Tony15246/uosc_danmaku/pull/377) [#380](https://github.com/Tony15246/uosc_danmaku/pull/380)），仅当专用解析器都无法解析获取站点弹幕时才会使用兜底服务器
+>
+> 不设置此选项的情况下默认使用 ` https://dmku.hls.one`作为兜底服务器
 
 #### 使用方法
 
 想要使用此选项，请在mpv配置文件夹下的 `script-opts`中创建 `uosc_danmaku.conf`文件并自定义如下内容：
 
 ```
-fallback_server=https://api.danmu.icu
+fallback_server=https://dmku.hls.one
 ```
 
 </details>
@@ -980,6 +1064,8 @@ title_replace
 
 自定义标题解析中的额外替换规则，内容格式为 JSON 字符串，替换模式为 lua 的 string.gsub 函数
 
+同时支持 JSON 规则文件路径（如 ~~/script-opts/title_replace.json），文件内容格式与示例字符串规则相同
+
 注意⚠️：由于 mpv 的 lua 版本限制，自定义规则只支持形如 %n 的捕获组写法，即示例用法，不支持直接替换字符的写法
 
 用法示例：
@@ -1043,6 +1129,64 @@ history_path=/path/to/your/danmaku-history.json
 
 ---
 
+<details>
+<summary>
+search_history_path
+
+> 指定弹幕搜索历史记录文件路径
+
+</summary>
+
+### search_history_path
+
+#### 功能说明
+
+指定弹幕搜索历史记录文件的路径，支持绝对路径和相对路径。默认值是 `~~/danmaku-search-history.json` 也就是mpv配置文件夹的根目录下。
+
+开启后，搜索过的弹幕关键词会记录在搜索菜单中（去重置顶，最近使用的排在最前），下次打开搜索菜单时可以直接选择历史关键词重新搜索，无需重复输入。
+
+> **⚠️NOTE！**
+> 
+> 留空此选项可禁用搜索历史功能
+
+#### 使用示例
+
+想要配置此选项，请在mpv配置文件夹下的 `script-opts`中创建 `uosc_danmaku.conf`文件并添加类似如下内容：
+
+```
+search_history_path=/path/to/your/danmaku-search-history.json
+```
+
+</details>
+
+---
+
+<details>
+<summary>
+search_history_size
+
+> 指定搜索历史最多保留的条数
+
+</summary>
+
+### search_history_size
+
+#### 功能说明
+
+指定搜索历史最多保留的条数。超出上限时从最早的记录开始丢弃，默认值为 `15`，小于 1 表示不限制。
+
+#### 使用示例
+
+想要配置此选项，请在mpv配置文件夹下的 `script-opts`中创建 `uosc_danmaku.conf`文件并添加类似如下内容：
+
+```
+search_history_size=30
+```
+
+</details>
+
+---
+
 ### 自定义弹幕样式相关配置
 
 默认配置如下，可根据需求更改并自定义弹幕样式
@@ -1078,10 +1222,16 @@ blacklist_path=
     从 `user-data/uosc_danmaku/danmaku-delay`属性中可以获取到当前弹幕延迟的值，具体用法可以参考[此issue](https://github.com/Tony15246/uosc_danmaku/issues/77)
 
 - `user-data/uosc_danmaku/has-danmaku`
+
     从`user-data/uosc_danmaku/has-danmaku`属性中可以获取到表示当前是否有弹幕在显示的布尔值，具体用法可以参考[此pr](https://github.com/Tony15246/uosc_danmaku/pull/276)
 
 - `user-data/uosc_danmaku/danmaku-switch-on`
+
     从`user-data/uosc_danmaku/danmaku-switch-on`属性中可以获取到表示当前弹幕开关状态的布尔值，具体用法可以参考[此issue](https://github.com/Tony15246/uosc_danmaku/issues/362)
+
+- `user-data/uosc_danmaku/danmaku-count`
+
+    从`user-data/uosc_danmaku/danmaku-count`属性中可以获取到当前弹幕池里的弹幕总数
 
 ## 常见问题
 

@@ -55,71 +55,68 @@ local function decode_html_entities(text)
     end)
 end
 
+-- 黑名单模式状态（惰性初始化，不依赖模块加载顺序）
+local blacklist_patterns = nil
+
+function get_blacklist_path()
+    local path = options and options.blacklist_path
+    -- 未指定（空/纯空白）时返回 nil —— nil 即“未配置”：
+    if type(path) ~= "string" or path:match("^%s*$") then return nil end
+    local ok, expanded = pcall(mp.command_native, { "expand-path", path })
+    if not ok or type(expanded) ~= "string" or expanded == "" then return nil end
+    return expanded
+end
+
 -- 加载黑名单模式
-local function load_blacklist_patterns(filepath)
-    local patterns = {}
-    if not file_exists(filepath) then
-        return patterns
-    end
-    local file = io.open(filepath, "r")
-    if not file then
-        msg.error("无法打开黑名单文件: " .. filepath)
-        return patterns
-    end
-
-    if string.match(filepath, "%.xml$") then
-        -- xml文件格式示例
-        --<?xml version="1.0" encoding="utf-8"?>
-        --<filters>
-        --  <item enabled="true">t=卡在</item>
-        --  <item enabled="true">t=进度条</item>
-        --</filters>
-        print("加载黑名单文件: " .. filepath)
-        for line in file:lines() do
-            local pattern = line:match('<item%s+enabled="true">t=(.-)</item>')
-            if pattern then
-                print("加载黑名单模式: " .. pattern)
-                table.insert(patterns, pattern)
-            end
-        end
-    end
-
-    if string.match(filepath, "%.json$") then
-        -- json文件格式示例
-        -- [{"type":0,"filter":"开门","opened":true,"id":15628936}
-        -- ,{"type":0,"filter":"tony","opened":true,"id":15628939}
-        -- ,{"type":1,"filter":"0+.1","opened":true,"id":15628951}]
-        local content = read_file(filepath)
+function get_blacklist_patterns(force)
+    if blacklist_patterns == nil or force then
+        blacklist_patterns = {}
+        local path = get_blacklist_path()
+        local content = path and file_exists(path) and read_file(path)
         if content then
-            local json = utils.parse_json(content)
-            if json and type(json) == "table" then
-                for _, entry in ipairs(json) do
-                    if entry.opened and entry.filter and entry.type == 0 then
-                        table.insert(patterns, entry.filter)
+            local ext = path:lower():match("%.([a-z]+)$")
+            if ext == "xml" then
+                -- xml文件格式示例
+                --<?xml version="1.0" encoding="utf-8"?>
+                --<filters>
+                --  <item enabled="true">t=卡在</item>
+                --  <item enabled="true">t=进度条</item>
+                --</filters>
+                for _, line in ipairs(split_lines(content)) do
+                    local enabled, pattern =
+                        line:match('<item%s+enabled="([^"]*)"%s*>t=(.-)</item>')
+                    if enabled == "true" and pattern then
+                        blacklist_patterns[#blacklist_patterns + 1] = pattern
+                    end
+                end
+            elseif ext == "json" then
+                -- json文件格式示例
+                -- [{"type":0,"filter":"开门","opened":true,"id":15628936}
+                -- ,{"type":0,"filter":"tony","opened":true,"id":15628939}
+                -- ,{"type":1,"filter":"0+.1","opened":true,"id":15628951}]
+                local data = utils.parse_json(content)
+                if type(data) == "table" then
+                    for _, e in ipairs(data) do
+                        if e.type == 0 and e.opened and e.filter then
+                            blacklist_patterns[#blacklist_patterns + 1] = e.filter
+                        end
+                    end
+                end
+            elseif ext == "txt" then
+                -- 文本文件格式示例
+                -- 卡在
+                -- 进度条
+                for _, line in ipairs(split_lines(content)) do
+                    line = line:match("^%s*(.-)%s*$")
+                    if line ~= "" then
+                        blacklist_patterns[#blacklist_patterns + 1] = line
                     end
                 end
             end
         end
     end
-
-    if string.match(filepath, "%.txt$") then
-        -- 文本文件格式示例
-        -- 卡在
-        -- 进度条
-        for line in file:lines() do
-            line = line:match("^%s*(.-)%s*$")
-            if line ~= "" then
-                table.insert(patterns, line)
-            end
-        end
-    end
-
-    file:close()
-    return patterns
+    return blacklist_patterns
 end
-
-local blacklist_file = mp.command_native({ "expand-path", options.blacklist_path })
-local black_patterns = load_blacklist_patterns(blacklist_file)
 
 -- 检查字符串是否在黑名单中
 function is_blacklisted(str, patterns)
@@ -228,7 +225,7 @@ local function merge_duplicate_danmaku(danmakus, threshold)
                         end
                     end
                 end
-                
+
                 for _, cg in ipairs(color_groups) do
                     table.insert(final_groups, cg)
                 end
@@ -271,6 +268,7 @@ local function merge_duplicate_danmaku(danmakus, threshold)
                 text = base.text,
                 source = base.source,
                 orig_time = base.orig_time,
+                merge_count = count,
             }
             if count > 2 or not same_time then
                 danmaku.text = danmaku.text .. string.format("x%d", count)
@@ -437,104 +435,137 @@ end
 local DanmakuArray = {}
 DanmakuArray.__index = DanmakuArray
 
-function DanmakuArray:new(res_x, res_y, font_size)
+-- 取整前的对数映射严格递增且严格凹。
+-- 取整后的整数字号单调不减，最大字号用于避免合并数量过大时字号失控。
+function DanmakuArray.get_merged_font_size(base_size, count, growth, max_size)
+    local base = positive_integer(base_size, 1)
+    local n = positive_integer(count, 1)
+    local scale = positive_integer(growth, 8)
+    local maximum = math.max(base, positive_integer(max_size, base))
+    local size = base + math.floor(scale * math.log(n) + 0.5)
+    return math.min(maximum, size)
+end
+
+function DanmakuArray:new(max_y)
     local obj = {
-        solution_y = res_y,
-        font_size = font_size,
-        rows = math.floor(res_y / font_size),
-        time_length_array = {}
+        max_y = positive_integer(max_y, 1),
+        danmakus = {},
     }
-    for i = 1, obj.rows do
-        obj.time_length_array[i] = { time = 0, length = 0, empty = true }
-    end
     setmetatable(obj, self)
     return obj
 end
 
-function DanmakuArray:set_time_length(row, time, length)
-    if row > 0 and row <= self.rows then
-        self.time_length_array[row] = { time = time, length = length, empty = false }
-    end
-end
-
-function DanmakuArray:get_time(row)
-    if row > 0 and row <= self.rows then
-        return self.time_length_array[row].time
-    end
-    return -1
-end
-
-function DanmakuArray:get_length(row)
-    if row > 0 and row <= self.rows then
-        return self.time_length_array[row].length
-    end
-    return 0
-end
-
-function DanmakuArray:is_empty(row)
-    if row > 0 and row <= self.rows then
-        return self.time_length_array[row].empty
-    end
-    return false
-end
-
--- 滚动弹幕 Y 坐标算法
-function get_position_y(font_size, appear_time, text_length, resolution_x, roll_time, array)
-    local velocity = (text_length + resolution_x) / roll_time
-
-    for i = 1, array.rows do
-        local previous_appear_time = array:get_time(i)
-        if array:is_empty(i) then
-            array:set_time_length(i, appear_time, text_length)
-            return 1 + (i - 1) * font_size
-        end
-
-        local previous_length = array:get_length(i)
-        local previous_velocity = (previous_length + resolution_x) / roll_time
-        local delta_velocity = velocity - previous_velocity
-        local delta_x = (appear_time - previous_appear_time) * previous_velocity - previous_length
-
-        if delta_x >= 0 then
-            if delta_velocity <= 0 then
-                array:set_time_length(i, appear_time, text_length)
-                return 1 + (i - 1) * font_size
-            end
-
-            local delta_time = delta_x / delta_velocity
-            if delta_time >= roll_time then
-                array:set_time_length(i, appear_time, text_length)
-                return 1 + (i - 1) * font_size
-            end
+-- 弹幕按出现时间递增的顺序处理。滚动弹幕完全移出屏幕后，或固定弹幕的
+-- 显示时间结束后，它便不可能与当前及之后的弹幕碰撞，因此可以安全删除。
+function DanmakuArray:remove_expired(now)
+    for i = #self.danmakus, 1, -1 do
+        if self.danmakus[i].end_time <= now then
+            table.remove(self.danmakus, i)
         end
     end
-    -- 所有行都被占用，放弃渲染
+end
+
+local function y_intersects(y1, height1, y2, height2)
+    return y1 < y2 + height2 and y2 < y1 + height1
+end
+
+local function rolling_danmaku_collides(previous, start_time, velocity)
+    local delta_velocity = velocity - previous.velocity
+    local delta_x = (start_time - previous.start_time) * previous.velocity - previous.length
+
+    -- delta_x 小于 0 表示旧弹幕尾部尚未进入屏幕，新弹幕出现时会直接重叠。
+    if delta_x < 0 then
+        return true
+    end
+
+    -- 新弹幕速度不大于旧弹幕时，不会缩短已有的 delta_x 间距。
+    if delta_velocity <= 0 then
+        return false
+    end
+
+    -- 比较从新弹幕出现开始的追尾时间与旧弹幕的剩余显示时间；
+    -- 只有在旧弹幕离屏前追上它，才会发生碰撞。
+    local delta_time = delta_x / delta_velocity
+    local remaining_time = previous.end_time - start_time
+    return delta_time < remaining_time
+end
+
+-- 从 y 轴顶部开始寻找可插入位置。对于每个候选位置，只检查 y 轴区间
+-- 与新弹幕相交的已有弹幕；若其中存在碰撞，则跳到碰撞区间下方继续寻找。
+local function find_y_from_top(array, height, collides)
+    local y = 1
+    while y + height - 1 <= array.max_y do
+        local next_y = nil
+        for _, danmaku in ipairs(array.danmakus) do
+            if y_intersects(y, height, danmaku.y, danmaku.height) and collides(danmaku) then
+                local below = danmaku.y + danmaku.height
+                next_y = next_y and math.max(next_y, below) or below
+            end
+        end
+        if not next_y then return y end
+        y = next_y
+    end
     return nil
 end
 
--- 固定弹幕 Y 坐标算法
-function get_fixed_y(font_size, appear_time, fixtime, array, from_top)
-    local row_start, row_end, row_step
+-- 从 y 轴顶部开始寻找滚动弹幕的位置，并记录成功插入的弹幕所占区间。
+function DanmakuArray:get_position_y(start_time, length, height, resolution_x, duration)
+    height = positive_integer(height, 1)
+    length = math.max(0, tonumber(length) or 0)
+    resolution_x = math.max(1, tonumber(resolution_x) or 1)
+    duration = math.max(0.001, tonumber(duration) or 0.001)
+    self:remove_expired(start_time)
+
+    local velocity = (length + resolution_x) / duration
+    local y = find_y_from_top(self, height, function(previous)
+        return rolling_danmaku_collides(previous, start_time, velocity)
+    end)
+    if not y then return nil end
+
+    self.danmakus[#self.danmakus + 1] = {
+        y = y,
+        height = height,
+        start_time = start_time,
+        end_time = start_time + duration,
+        length = length,
+        velocity = velocity,
+    }
+    return y
+end
+
+-- 顶部固定弹幕自上而下寻找位置，底部固定弹幕则自下而上寻找位置。
+function DanmakuArray:get_fixed_y(start_time, height, duration, from_top)
+    height = positive_integer(height, 1)
+    duration = math.max(0.001, tonumber(duration) or 0.001)
+    self:remove_expired(start_time)
+
+    local y
     if from_top then
-        row_start, row_end, row_step = 1, array.rows, 1
+        y = find_y_from_top(self, height, function() return true end)
     else
-        row_start, row_end, row_step = array.rows, 1, -1
+        y = self.max_y - height + 1
+        while y >= 1 do
+            local next_y = nil
+            for _, danmaku in ipairs(self.danmakus) do
+                if y_intersects(y, height, danmaku.y, danmaku.height) then
+                    local above = danmaku.y - height
+                    next_y = next_y and math.min(next_y, above) or above
+                end
+            end
+            if not next_y then break end
+            y = next_y
+        end
+        if y < 1 then y = nil end
     end
 
-    for i = row_start, row_end, row_step do
-        local previous_appear_time = array:get_time(i)
-        if array:is_empty(i) then
-            array:set_time_length(i, appear_time, 0)
-            return (i - 1) * font_size + 1
-        else
-            local delta_time = appear_time - previous_appear_time
-            if delta_time > fixtime then
-                array:set_time_length(i, appear_time, 0)
-                return (i - 1) * font_size + 1
-            end
-        end
-    end
-    -- 所有行都被占用，放弃渲染
-    return nil
+    if not y then return nil end
+    self.danmakus[#self.danmakus + 1] = {
+        y = y,
+        height = height,
+        start_time = start_time,
+        end_time = start_time + duration,
+    }
+    return y
 end
 
 -- 将弹幕转换为 XML 格式
@@ -620,7 +651,7 @@ function convert_danmaku_to_ass_events(force)
                     text = d.text,
                     source = url,
                 }
-                if not is_blacklisted(d.text, black_patterns) then
+                if not is_blacklisted(d.text, get_blacklist_patterns()) then
                     table.insert(list, entry)
                 end
             end
@@ -674,14 +705,17 @@ function convert_danmaku_to_ass_events(force)
     end
 
     local fontsize = tonumber(options.fontsize) or 50
+    local fontsize_growth = tonumber(options.merge_fontsize_growth) or 8
+    local fontsize_max = tonumber(options.merge_fontsize_max) or 100
     local scrolltime = tonumber(options.scrolltime) or 15
     local fixtime = tonumber(options.fixtime) or 5
 
     local res_x = 1920
     local res_y = 1080
 
-    local roll_array = DanmakuArray:new(res_x, res_y, fontsize)
-    local top_array = DanmakuArray:new(res_x, res_y, fontsize)
+    local display_height = math.max(1, math.floor(res_y * (tonumber(options.displayarea) or 1)))
+    local roll_array = DanmakuArray:new(display_height)
+    local fixed_array = DanmakuArray:new(display_height)
 
     -- 预处理弹幕，先计算时间段以便进行数量限制
     local pre_events = {}
@@ -715,6 +749,9 @@ function convert_danmaku_to_ass_events(force)
         local clean_text = ch_convert_cached(decode_html_entities(d.text))
         local text = ass_escape(clean_text)
                     :gsub("x(%d+)$", "{\\b1\\i1}x%1")
+        local event_fontsize = DanmakuArray.get_merged_font_size(
+            fontsize, d.merge_count or 1, fontsize_growth, fontsize_max
+        )
 
         -- 颜色从十进制转为 BGR Hex
         local color = math.max(0, math.min(d.color or 0xFFFFFF, 0xFFFFFF))
@@ -730,10 +767,10 @@ function convert_danmaku_to_ass_events(force)
         -- 滚动弹幕 (类型 1, 2, 3)
         if danmaku_type >= 1 and danmaku_type <= 3 then
             style = "R2L"
-            local text_length = get_str_width(text, fontsize)
+            local text_length = get_str_width(clean_text, event_fontsize)
             local x1 = res_x + text_length / 2
             local x2 = -text_length / 2
-            local y = get_position_y(fontsize, appear_time, text_length, res_x, scrolltime, roll_array)
+            local y = roll_array:get_position_y(appear_time, text_length, event_fontsize, res_x, scrolltime)
             if y then
                 effect = string.format("{\\move(%d, %d, %d, %d)}", x1, y, x2, y)
                 move = {x1, y, x2, y}
@@ -743,7 +780,7 @@ function convert_danmaku_to_ass_events(force)
         elseif danmaku_type == 5 then
             style = "TOP"
             local x = res_x / 2
-            local y = get_fixed_y(fontsize, appear_time, fixtime, top_array, true)
+            local y = fixed_array:get_fixed_y(appear_time, event_fontsize, fixtime, true)
             if y then
                 effect = string.format("{\\pos(%d, %d)}", x, y)
                 pos = {x, y}
@@ -753,7 +790,7 @@ function convert_danmaku_to_ass_events(force)
         elseif danmaku_type == 4 then
             style = "BTM"
             local x = res_x / 2
-            local y = get_fixed_y(fontsize, appear_time, fixtime, top_array, false)
+            local y = fixed_array:get_fixed_y(appear_time, event_fontsize, fixtime, false)
             if y then
                 effect = string.format("{\\pos(%d, %d)}", x, y)
                 pos = {x, y}
@@ -774,9 +811,11 @@ function convert_danmaku_to_ass_events(force)
                 move = move,
                 layer = (style == "R2L") and 0 or 1,
                 source = d.source,
+                font_size = event_fontsize,
+                merge_count = d.merge_count or 1,
             }
             table.insert(ass_events, event)
-            COMMENTS = ass_events
         end
     end
+    COMMENTS = ass_events
 end
