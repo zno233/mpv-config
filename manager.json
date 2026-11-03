@@ -16,7 +16,7 @@
       "source": ".",
       "destination": "scripts/uosc_danmaku",
       "mode": "check",
-      "baseline": "948f64eef08011faf2f3eb43050062d7ce5ed1ba"
+      "baseline": "d896f179aac1c9e7e657664dbe8a69567a9a4900"
     },
     {
       "name": "sub-assrt",

@@ -519,6 +519,35 @@ local function resolve_source_tree(mirror, commit, source_path)
     return trim(output)
 end
 
+-- 列出本地缓存裸仓库中一棵树里全部文件的 blob 摘要，作为上一次安装的快照基准
+local function tree_manifest(mirror, tree)
+    local ok, output = command({ 'git', '--git-dir=' .. mirror, 'ls-tree', '-r', '--', tree })
+    if not ok then return nil, output end
+    local manifest = {}
+    for line in output:gmatch('[^\r\n]+') do
+        local hash, path = line:match('^%d+ %a+ (%x+)%s+(.+)$')
+        if hash then manifest[path] = hash end
+    end
+    return manifest
+end
+
+-- 单次 subprocess 批量计算一组本地文件的 blob 摘要，顺序与入参一致
+local function hash_files(paths)
+    if #paths == 0 then return {} end
+    local args = { 'git', 'hash-object', '--' }
+    for _, path in ipairs(paths) do args[#args + 1] = path end
+    local ok, output = command(args)
+    if not ok then return nil, output end
+    local hashes = {}
+    local count = 0
+    for line in output:gmatch('[^\r\n]+') do
+        count = count + 1
+        hashes[count] = trim(line)
+    end
+    if count ~= #paths then return nil, 'unexpected hash-object output' end
+    return hashes
+end
+
 local function hash_directory(mirror, source, destination)
     if not exists(destination, 'dir') then return nil end
     local index_path = unique_path(join(store, 'index-' .. source.name))
@@ -760,6 +789,52 @@ local function merge_source(source, mirror, head, state, index, total)
 
     local upstream_files = walk_files(staging)
     local updated_count = 0
+    local protected_count = 0
+    local failed_count = 0
+
+    -- 以已安装快照为基准做逐文件本地改动保护：
+    -- 本地文件与快照 blob 不一致，说明自上次 merge 后被手工改过，跳过覆盖保住本地版本
+    local snapshot
+    if entry.installed then
+        local installed_tree, snapshot_error = resolve_source_tree(mirror, entry.installed, source.source)
+        if installed_tree then
+            snapshot = tree_manifest(mirror, installed_tree)
+        else
+            say('warn', source.name .. ': could not resolve install snapshot: ' .. tostring(snapshot_error))
+        end
+    end
+
+    local managed = {}
+    local deleted = {}
+    local pending_list = {}
+    for _, rel in ipairs(upstream_files) do
+        local upstream_path = source.source == '.' and rel or (source.source .. '/' .. rel)
+        local snapshot_hash = snapshot and snapshot[upstream_path]
+        if snapshot_hash then
+            local dst = join(destination, rel)
+            managed[rel] = { dst = dst, snapshot = snapshot_hash }
+            if exists(dst) then
+                pending_list[#pending_list + 1] = managed[rel]
+            else
+                deleted[rel] = true
+            end
+        end
+    end
+
+    if #pending_list > 0 then
+        local local_hashes, batch_error = hash_files((function()
+            local paths = {}
+            for _, item in ipairs(pending_list) do paths[#paths + 1] = item.dst end
+            return paths
+        end)())
+        if not local_hashes then
+            sys_remove_all(staging)
+            return false, 'could not hash local files: ' .. tostring(batch_error), 'error'
+        end
+        for i, item in ipairs(pending_list) do
+            item.current = local_hashes[i]
+        end
+    end
 
     for _, rel in ipairs(upstream_files) do
         local src = join(staging, rel)
@@ -769,6 +844,18 @@ local function merge_source(source, mirror, head, state, index, total)
             sys_mkdir(dst_dir)
         end
 
+        local item = managed[rel]
+        if deleted[rel] then
+            protected_count = protected_count + 1
+            say('warn', source.name .. ': locally removed, not restored: ' .. rel)
+            goto continue
+        elseif item and item.current and item.current ~= item.snapshot then
+            protected_count = protected_count + 1
+            say('warn', source.name .. ': local changes kept: ' .. rel)
+            goto continue
+        end
+
+        local backup
         if exists(dst) then
             local src_info = utils.file_info(src)
             local dst_info = utils.file_info(dst)
@@ -791,15 +878,23 @@ local function merge_source(source, mirror, head, state, index, total)
                 end
             end
             local backup_name = source.name .. '/' .. rel:gsub('[/]', '%%')
-            move_to_backup(dst, backup_name, 'merge')
+            backup = move_to_backup(dst, backup_name, 'merge')
         end
 
+        local copied, copy_output
         if plat == 'windows' then
             local win_src = src:gsub('/', '\\')
             local win_dst = dst:gsub('/', '\\')
-            command({ 'cmd', '/c', string.format('copy /Y "%s" "%s"', win_src, win_dst) })
+            copied, copy_output = command({ 'cmd', '/c', string.format('copy /Y "%s" "%s"', win_src, win_dst) })
         else
-            command({ 'cp', '-p', src, dst })
+            copied, copy_output = command({ 'cp', '-p', src, dst })
+        end
+        if not copied then
+            -- 覆盖失败时恢复原文件，避免目标位置只剩备份
+            if backup then os.rename(backup, dst) end
+            failed_count = failed_count + 1
+            say('warn', source.name .. ': could not merge ' .. rel .. ': ' .. tostring(copy_output))
+            goto continue
         end
         updated_count = updated_count + 1
 
@@ -815,8 +910,16 @@ local function merge_source(source, mirror, head, state, index, total)
     if not saved then say('warn', source.name .. ': could not save state: ' .. save_error) end
 
     local detail = string.format('merged %d file(s) to %s', updated_count, short_commit(head))
-    show_progress(index, total, source.name, detail, 1, 'green')
-    return true, detail, 'updated'
+    if protected_count > 0 then
+        detail = detail .. '; kept ' .. protected_count .. ' local change(s)'
+    end
+    if failed_count > 0 then
+        detail = detail .. '; ' .. failed_count .. ' failed'
+    end
+    local kind = updated_count > 0 and 'updated'
+        or (protected_count > 0 and 'protected' or 'unchanged')
+    show_progress(index, total, source.name, detail, 1, kind == 'protected' and 'yellow' or 'green')
+    return true, detail, kind
 end
 
 local function process_source(source, state, index, total, prefetch_result)
